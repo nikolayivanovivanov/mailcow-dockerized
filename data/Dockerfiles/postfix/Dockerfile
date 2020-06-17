@@ -36,6 +36,7 @@ COPY zeyple.conf /etc/zeyple.conf
 COPY supervisord.conf /etc/supervisor/supervisord.conf
 COPY postfix.sh /opt/postfix.sh
 COPY whitelist_forwardinghosts.sh /usr/local/bin/whitelist_forwardinghosts.sh
+COPY syslog-ng /etc/logrotate.d/syslog-ng
 
 EXPOSE 588
 

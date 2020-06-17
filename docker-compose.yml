@@ -10,6 +10,10 @@ services:
       volumes:
         - ./data/conf/bind9/named.conf:/etc/bind/named.conf
       restart: always
+      logging:
+        driver: syslog
+        options:
+          syslog-address: "tcp://127.0.0.1:524"
       networks:
         mailcow-network:
           ipv4_address: 172.22.1.254
@@ -17,7 +21,8 @@ services:
             - bind9
 
     mysql-mailcow:
-      image: mariadb:10.1
+      image: mailcow/mariadb
+      build: ./data/Dockerfiles/mysql
       healthcheck:
         test: ["CMD", "mysqladmin", "ping", "--host", "localhost", "--silent"]
         interval: 10s
@@ -35,6 +40,10 @@ services:
         - MYSQL_USER=${DBUSER}
         - MYSQL_PASSWORD=${DBPASS}
       restart: always
+      logging:
+        driver: syslog
+        options:
+          syslog-address: "tcp://127.0.0.1:524"
       networks:
         mailcow-network:
           aliases:
@@ -50,6 +59,10 @@ services:
       dns:
         - 172.22.1.254
       dns_search: mailcow-network
+      logging:
+        driver: syslog
+        options:
+          syslog-address: "tcp://127.0.0.1:524"
       networks:
         mailcow-network:
           aliases:
@@ -62,6 +75,10 @@ services:
       dns:
         - 172.22.1.254
       dns_search: mailcow-network
+      logging:
+        driver: syslog
+        options:
+          syslog-address: "tcp://127.0.0.1:524"
       networks:
         mailcow-network:
           aliases:
@@ -88,6 +105,10 @@ services:
       dns:
         - 172.22.1.254
       dns_search: mailcow-network
+      logging:
+        driver: syslog
+        options:
+          syslog-address: "tcp://127.0.0.1:524"
       networks:
         mailcow-network:
           ipv4_address: 172.22.1.253
@@ -113,6 +134,10 @@ services:
         - DBPASS=${DBPASS}
         - MAILCOW_HOSTNAME=${MAILCOW_HOSTNAME}
       restart: always
+      logging:
+        driver: syslog
+        options:
+          syslog-address: "tcp://127.0.0.1:524"
       networks:
         mailcow-network:
           aliases:
@@ -135,6 +160,10 @@ services:
         - ./data/conf/sogo/:/etc/sogo/
         - /usr/lib/GNUstep/SOGo/WebServerResources/
       restart: always
+      logging:
+        driver: syslog
+        options:
+          syslog-address: "tcp://127.0.0.1:524"
       networks:
         mailcow-network:
           ipv4_address: 172.22.1.252
@@ -152,6 +181,10 @@ services:
       dns:
         - 172.22.1.254
       dns_search: mailcow-network
+      logging:
+        driver: syslog
+        options:
+          syslog-address: "tcp://127.0.0.1:524"
       networks:
         mailcow-network:
           aliases:
@@ -183,6 +216,10 @@ services:
       dns_search: mailcow-network
       restart: always
       hostname: ${MAILCOW_HOSTNAME}
+      logging:
+        driver: syslog
+        options:
+          syslog-address: "tcp://127.0.0.1:524"
       networks:
         mailcow-network:
           aliases:
@@ -211,6 +248,10 @@ services:
       dns:
         - 172.22.1.254
       dns_search: mailcow-network
+      logging:
+        driver: syslog
+        options:
+          syslog-address: "tcp://127.0.0.1:524"
       networks:
         mailcow-network:
           aliases:
@@ -224,6 +265,10 @@ services:
       dns:
         - 172.22.1.254
       dns_search: mailcow-network
+      logging:
+        driver: syslog
+        options:
+          syslog-address: "tcp://127.0.0.1:524"
       networks:
         mailcow-network:
           aliases:
@@ -259,6 +304,10 @@ services:
         - "${HTTPS_BIND:-0.0.0.0}:${HTTPS_PORT:-443}:${HTTPS_PORT:-443}"
         - "${HTTP_BIND:-127.0.0.1}:${HTTP_PORT:-80}:${HTTP_PORT:-80}"
       restart: always
+      logging:
+        driver: syslog
+        options:
+          syslog-address: "tcp://127.0.0.1:524"
       networks:
         mailcow-network:
           ipv4_address: 172.22.1.251
