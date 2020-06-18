@@ -53,6 +53,7 @@ RUN chmod +x /opt/postfix.sh \
   /usr/local/bin/whitelist_forwardinghosts.sh \
   /usr/local/sbin/stop-supervisor.sh
 RUN rm -rf /tmp/* /var/tmp/*
+COPY syslog-ng /etc/logrotate.d/syslog-ng
 
 EXPOSE 588
 
