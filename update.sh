@@ -440,37 +440,38 @@ for container in "${MAILCOW_CONTAINERS[@]}"; do
   docker rm -f "$container" 2> /dev/null
 done
 
+# Dont update from remote server and don't merge
 # Silently fixing remote url from andryyy to mailcow
 #git remote set-url origin https://github.com/mailcow/mailcow-dockerized
-echo -e "\e[32mCommitting current status...\e[0m"
-[[ -z "$(git config user.name)" ]] && git config user.name moo
-[[ -z "$(git config user.email)" ]] && git config user.email moo@cow.moo
-[[ ! -z $(git ls-files data/conf/rspamd/override.d/worker-controller-password.inc) ]] && git rm data/conf/rspamd/override.d/worker-controller-password.inc
-git add -u
-git commit -am "Before update on ${DATE}" > /dev/null
-echo -e "\e[32mFetching updated code from remote...\e[0m"
-git fetch origin #${BRANCH}
-echo -e "\e[32mMerging local with remote code (recursive, strategy: \"${MERGE_STRATEGY:-theirs}\", options: \"patience\"...\e[0m"
-git config merge.defaultToUpstream true
-git merge -X${MERGE_STRATEGY:-theirs} -Xpatience -m "After update on ${DATE}"
-# Need to use a variable to not pass return codes of if checks
-MERGE_RETURN=$?
-if [[ ${MERGE_RETURN} == 128 ]]; then
-  echo -e "\e[31m\nOh no, what happened?\n=> You most likely added files to your local mailcow instance that were now added to the official mailcow repository. Please move them to another location before updating mailcow.\e[0m"
-  exit 1
-elif [[ ${MERGE_RETURN} == 1 ]]; then
-  echo -e "\e[93mPotenial conflict, trying to fix...\e[0m"
-  git status --porcelain | grep -E "UD|DU" | awk '{print $2}' | xargs rm -v
-  git add -A
-  git commit -m "After update on ${DATE}" > /dev/null
-  git checkout .
-  echo -e "\e[32mRemoved and recreated files if necessary.\e[0m"
-elif [[ ${MERGE_RETURN} != 0 ]]; then
-  echo -e "\e[31m\nOh no, something went wrong. Please check the error message above.\e[0m"
-  echo
-  echo "Run docker-compose up -d to restart your stack without updates or try again after fixing the mentioned errors."
-  exit 1
-fi
+#echo -e "\e[32mCommitting current status...\e[0m"
+#[[ -z "$(git config user.name)" ]] && git config user.name moo
+#[[ -z "$(git config user.email)" ]] && git config user.email moo@cow.moo
+#[[ ! -z $(git ls-files data/conf/rspamd/override.d/worker-controller-password.inc) ]] && git rm data/conf/rspamd/override.d/worker-controller-password.inc
+#git add -u
+#git commit -am "Before update on ${DATE}" > /dev/null
+#echo -e "\e[32mFetching updated code from remote...\e[0m"
+#git fetch origin #${BRANCH}
+#echo -e "\e[32mMerging local with remote code (recursive, strategy: \"${MERGE_STRATEGY:-theirs}\", options: \"patience\"...\e[0m"
+#git config merge.defaultToUpstream true
+#git merge -X${MERGE_STRATEGY:-theirs} -Xpatience -m "After update on ${DATE}"
+## Need to use a variable to not pass return codes of if checks
+#MERGE_RETURN=$?
+#if [[ ${MERGE_RETURN} == 128 ]]; then
+#  echo -e "\e[31m\nOh no, what happened?\n=> You most likely added files to your local mailcow instance that were now added to the official mailcow repository. Please move them to another location before updating mailcow.\e[0m"
+#  exit 1
+#elif [[ ${MERGE_RETURN} == 1 ]]; then
+#  echo -e "\e[93mPotenial conflict, trying to fix...\e[0m"
+#  git status --porcelain | grep -E "UD|DU" | awk '{print $2}' | xargs rm -v
+#  git add -A
+#  git commit -m "After update on ${DATE}" > /dev/null
+#  git checkout .
+#  echo -e "\e[32mRemoved and recreated files if necessary.\e[0m"
+#elif [[ ${MERGE_RETURN} != 0 ]]; then
+#  echo -e "\e[31m\nOh no, something went wrong. Please check the error message above.\e[0m"
+#  echo
+#  echo "Run docker-compose up -d to restart your stack without updates or try again after fixing the mentioned errors."
+#  exit 1
+#fi
 
 if [[ ${NO_UPDATE_COMPOSE} == "y" ]]; then
   echo -e "\e[33mNot fetching latest docker-compose, please check for updates manually!\e[0m"
