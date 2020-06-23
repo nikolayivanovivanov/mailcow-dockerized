@@ -413,10 +413,6 @@ services:
         - ./data/assets/ssl-example:/var/lib/ssl-example/:ro
         - mysql-socket-vol-1:/var/run/mysqld/
       restart: always
-      logging:
-        driver: syslog
-        options:
-          syslog-address: "tcp://127.0.0.1:524"
       networks:
         mailcow-network:
           aliases:
