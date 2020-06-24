@@ -2,3 +2,4 @@
 # Please create a file "extra.cf" for persistent overrides to main.cf
 # so this is copy of the only line, which I modified. It allows live servers to use the mail server as relay one
 mynetworks = 127.0.0.0/8 [::ffff:127.0.0.0]/104 [::1]/128 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 [fe80::]/10 [fc00::]/7 159.69.32.146 159.69.55.175 195.201.248.243
+smtp_address_preference = ipv4
