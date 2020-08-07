@@ -96,7 +96,7 @@ $PASSWD_REGEP = '.{6,}';
 // $PASSWD_REGEP = '^(?=.*[0-9])(?=.*[A-Za-z]).{6,}$';
 
 // Show DKIM private keys - false by default
-$SHOW_DKIM_PRIV_KEYS = false;
+$SHOW_DKIM_PRIV_KEYS = true;
 
 // mailcow Apps - buttons on login screen
 $MAILCOW_APPS = array(
