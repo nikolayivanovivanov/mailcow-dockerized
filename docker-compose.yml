@@ -92,6 +92,17 @@ services:
         - ./data/conf/rspamd/rspamd.conf.local:/etc/rspamd/rspamd.conf.local
         - ./data/conf/rspamd/rspamd.conf.override:/etc/rspamd/rspamd.conf.override
         - rspamd-vol-1:/var/lib/rspamd
+      # Default is 1024
+      cpu_shares: 2048
+      # aoa Not supported for version 2.1 - As rspamd hangs when 100% CPU is used, we set the CPU limit to 90% and the reservation to 25%
+      # deploy:
+      #   resources:
+      #     limits:
+      #       cpus: '0.9'
+      #       memory: 1024M
+      #     reservations:
+      #       cpus: '0.25'
+      #       memory: 512M
       restart: always
       dns:
         - ${IPV4_NETWORK:-172.22.1}.254
