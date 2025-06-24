@@ -18,7 +18,7 @@ alias_database = hash:/etc/aliases
 relayhost =
 # OLD ips mynetworks = 127.0.0.0/8 [::ffff:127.0.0.0]/104 [::1]/128 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 [fe80::]/10 [fc00::]/7 159.69.32.146 159.69.55.175 195.201.248.243 136.243.94.172
 # Add ips of the live server and the floating Hetzner IP attached to the live server
-mynetworks = 127.0.0.0/8 [::ffff:127.0.0.0]/104 [::1]/128 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 [fe80::]/10 [fc00::]/7 195.201.248.243 188.245.163.205
+mynetworks = 127.0.0.0/8 [::ffff:127.0.0.0]/104 [::1]/128 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 [fe80::]/10 [fc00::]/7 159.69.89.210 116.202.179.34 195.201.248.243 188.245.163.205
 mailbox_size_limit = 0
 recipient_delimiter = +
 inet_interfaces = all
