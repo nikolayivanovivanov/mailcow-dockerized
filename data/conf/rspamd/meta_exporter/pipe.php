@@ -24,6 +24,7 @@ catch (PDOException $e) {
 // Init Redis
 $redis = new Redis();
 $redis->connect('redis-mailcow', 6379);
+$redis->auth(getenv("REDISPASS"));
 
 // Functions
 function parse_email($email) {
@@ -31,36 +32,36 @@ function parse_email($email) {
   $a = strrpos($email, '@');
   return array('local' => substr($email, 0, $a), 'domain' => substr(substr($email, $a), 1));
 }
-if (!function_exists('getallheaders'))  {
-  function getallheaders() {
-    if (!is_array($_SERVER)) {
-      return array();
-    }
-    $headers = array();
-    foreach ($_SERVER as $name => $value) {
-      if (substr($name, 0, 5) == 'HTTP_') {
-        $headers[str_replace(' ', '-', ucwords(strtolower(str_replace('_', ' ', substr($name, 5)))))] = $value;
-      }
-    }
-    return $headers;
-  }
+// rspamd metadata_exporter (multipart formatter):
+//   - $_POST['metadata']        JSON with the rspamd metadata
+//   - $_FILES['message']        raw RFC822 message
+if (empty($_POST['metadata']) || !isset($_FILES['message']) || $_FILES['message']['error'] !== UPLOAD_ERR_OK) {
+  error_log("QUARANTINE: missing multipart parts from rspamd" . PHP_EOL);
+  http_response_code(400);
+  exit;
 }
 
-$raw_data_content = file_get_contents('php://input');
+$meta = json_decode($_POST['metadata'], true);
+if (!is_array($meta)) {
+  error_log("QUARANTINE: cannot decode metadata JSON" . PHP_EOL);
+  http_response_code(400);
+  exit;
+}
+
+$raw_data_content = file_get_contents($_FILES['message']['tmp_name']);
 $raw_data = mb_convert_encoding($raw_data_content, 'HTML-ENTITIES', "UTF-8");
-$headers = getallheaders();
+$raw_size = (int)$_FILES['message']['size'];
 
-$qid      = $headers['X-Rspamd-Qid'];
-$subject  = $headers['X-Rspamd-Subject'];
-$score    = $headers['X-Rspamd-Score'];
-$rcpts    = $headers['X-Rspamd-Rcpt'];
-$user     = $headers['X-Rspamd-User'];
-$ip       = $headers['X-Rspamd-Ip'];
-$action   = $headers['X-Rspamd-Action'];
-$sender   = $headers['X-Rspamd-From'];
-$symbols  = $headers['X-Rspamd-Symbols'];
-
-$raw_size = (int)$_SERVER['CONTENT_LENGTH'];
+$qid      = $meta['qid']     ?? 'unknown';
+$subject  = $meta['subject'] ?? '';
+$score    = $meta['score']   ?? 0;
+$rcpts    = $meta['rcpt']    ?? array();
+$user     = $meta['user']    ?? 'unknown';
+$ip       = $meta['ip']      ?? 'unknown';
+$action   = $meta['action']  ?? 'no action';
+$sender   = $meta['from']    ?? '';
+$symbols  = json_encode($meta['symbols'] ?? array());
+$fuzzy    = json_encode(is_array($meta['fuzzy'] ?? null) ? $meta['fuzzy'] : array());
 
 if (empty($sender)) {
   error_log("QUARANTINE: Unknown sender, assuming empty-env-from@localhost" . PHP_EOL);
@@ -88,13 +89,13 @@ catch (RedisException $e) {
 $rcpt_final_mailboxes = array();
 
 // Loop through all rcpts
-foreach (json_decode($rcpts, true) as $rcpt) {
+foreach ($rcpts as $rcpt) {
   // Remove tag
   $rcpt = preg_replace('/^(.*?)\+.*(@.*)$/', '$1$2', $rcpt);
-  
+
   // Break rcpt into local part and domain part
   $parsed_rcpt = parse_email($rcpt);
-  
+
   // Skip if not a mailcow handled domain
   try {
     if (!$redis->hGet('DOMAIN_MAP', $parsed_rcpt['domain'])) {
@@ -152,12 +153,12 @@ foreach (json_decode($rcpts, true) as $rcpt) {
 
       // Loop through all found gotos
       foreach ($gotos_array as $index => &$goto) {
-        error_log("RCPT RESOVLER: http pipe: query " . $goto . " as username from mailbox" . PHP_EOL);
-        $stmt = $pdo->prepare("SELECT `username` FROM `mailbox` WHERE `username` = :goto AND `active`= '1';");
+        error_log("RCPT RESOLVER: http pipe: query " . $goto . " as username from mailbox" . PHP_EOL);
+        $stmt = $pdo->prepare("SELECT `username` FROM `mailbox` WHERE `username` = :goto AND (`active`= '1' OR `active`= '2');");
         $stmt->execute(array(':goto' => $goto));
         $username = $stmt->fetch(PDO::FETCH_ASSOC)['username'];
         if (!empty($username)) {
-          error_log("RCPT RESOVLER: http pipe: mailbox found: " . $username . PHP_EOL);
+          error_log("RCPT RESOLVER: http pipe: mailbox found: " . $username . PHP_EOL);
           // Current goto is a mailbox, save to rcpt_final_mailboxes if not a duplicate
           if (!in_array($username, $rcpt_final_mailboxes)) {
             $rcpt_final_mailboxes[] = $username;
@@ -166,22 +167,22 @@ foreach (json_decode($rcpts, true) as $rcpt) {
         else {
           $parsed_goto = parse_email($goto);
           if (!$redis->hGet('DOMAIN_MAP', $parsed_goto['domain'])) {
-            error_log("RCPT RESOVLER:" . $goto . " is not a mailcow handled mailbox or alias address" . PHP_EOL);
+            error_log("RCPT RESOLVER:" . $goto . " is not a mailcow handled mailbox or alias address" . PHP_EOL);
           }
           else {
             $stmt = $pdo->prepare("SELECT `goto` FROM `alias` WHERE `address` = :goto AND `active` = '1'");
             $stmt->execute(array(':goto' => $goto));
             $goto_branch = $stmt->fetch(PDO::FETCH_ASSOC)['goto'];
             if ($goto_branch) {
-              error_log("RCPT RESOVLER: http pipe: goto address " . $goto . " is a alias branch for " . $goto_branch . PHP_EOL);
+              error_log("RCPT RESOLVER: http pipe: goto address " . $goto . " is an alias branch for " . $goto_branch . PHP_EOL);
               $goto_branch_array = explode(',', $goto_branch);
             } else {
-              $stmt = $pdo->prepare("SELECT `target_domain` FROM `alias_domain` WHERE `alias_domain` = :domain AND `active` AND '1'");
+              $stmt = $pdo->prepare("SELECT `target_domain` FROM `alias_domain` WHERE `alias_domain` = :domain AND `active` = '1'");
               $stmt->execute(array(':domain' => $parsed_goto['domain']));
               $goto_branch = $stmt->fetch(PDO::FETCH_ASSOC)['target_domain'];
               if ($goto_branch) {
-                error_log("RCPT RESOVLER: http pipe: goto domain " . $parsed_gto['domain'] . " is a domain alias branch for " . $goto_branch . PHP_EOL);
-                $goto_branch_array = array($parsed_gto['local'] . '@' . $goto_branch);
+                error_log("RCPT RESOLVER: http pipe: goto domain " . $parsed_goto['domain'] . " is a domain alias branch for " . $goto_branch . PHP_EOL);
+                $goto_branch_array = array($parsed_goto['local'] . '@' . $goto_branch);
               }
             }
           }
@@ -202,11 +203,11 @@ foreach (json_decode($rcpts, true) as $rcpt) {
       // Force exit if loop cannot be solved
       // Postfix does not allow for alias loops, so this should never happen.
       $loop_c++;
-      error_log("RCPT RESOVLER: http pipe: goto array count on loop #". $loop_c . " is " . count($gotos_array) . PHP_EOL);
+      error_log("RCPT RESOLVER: http pipe: goto array count on loop #". $loop_c . " is " . count($gotos_array) . PHP_EOL);
     }
   }
   catch (PDOException $e) {
-    error_log("RCPT RESOVLER: " . $e->getMessage() . PHP_EOL);
+    error_log("RCPT RESOLVER: " . $e->getMessage() . PHP_EOL);
     http_response_code(502);
     exit;
   }
@@ -215,8 +216,8 @@ foreach (json_decode($rcpts, true) as $rcpt) {
 foreach ($rcpt_final_mailboxes as $rcpt_final) {
   error_log("QUARANTINE: quarantine pipe: processing quarantine message for rcpt " . $rcpt_final . PHP_EOL);
   try {
-    $stmt = $pdo->prepare("INSERT INTO `quarantine` (`qid`, `subject`, `score`, `sender`, `rcpt`, `symbols`, `user`, `ip`, `msg`, `action`)
-      VALUES (:qid, :subject, :score, :sender, :rcpt, :symbols, :user, :ip, :msg, :action)");
+    $stmt = $pdo->prepare("INSERT INTO `quarantine` (`qid`, `subject`, `score`, `sender`, `rcpt`, `symbols`, `user`, `ip`, `msg`, `action`, `fuzzy_hashes`)
+      VALUES (:qid, :subject, :score, :sender, :rcpt, :symbols, :user, :ip, :msg, :action, :fuzzy_hashes)");
     $stmt->execute(array(
       ':qid' => $qid,
       ':subject' => $subject,
@@ -227,8 +228,12 @@ foreach ($rcpt_final_mailboxes as $rcpt_final) {
       ':user' => $user,
       ':ip' => $ip,
       ':msg' => $raw_data,
-      ':action' => $action
+      ':action' => $action,
+      ':fuzzy_hashes' => $fuzzy
     ));
+    $lastId = $pdo->lastInsertId();
+    $stmt_update = $pdo->prepare("UPDATE `quarantine` SET `qhash` = SHA2(CONCAT(`id`, `qid`), 256) WHERE `id` = :id");
+    $stmt_update->execute(array(':id' => $lastId));
     $stmt = $pdo->prepare('DELETE FROM `quarantine` WHERE `rcpt` = :rcpt AND `id` NOT IN (
       SELECT `id`
       FROM (
@@ -237,7 +242,7 @@ foreach ($rcpt_final_mailboxes as $rcpt_final) {
         WHERE `rcpt` = :rcpt2
         ORDER BY id DESC
         LIMIT :retention_size
-      ) x 
+      ) x
     );');
     $stmt->execute(array(
       ':rcpt' => $rcpt_final,

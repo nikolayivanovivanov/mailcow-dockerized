@@ -26,9 +26,8 @@ catch (PDOException $e) {
 }
 
 // Check if db changed and return header
-/*
-$stmt = $pdo->prepare("SELECT MAX(UNIX_TIMESTAMP(UPDATE_TIME)) AS `db_update_time` FROM information_schema.tables
-  WHERE (`TABLE_NAME` = 'filterconf' OR `TABLE_NAME` = 'settingsmap')
+$stmt = $pdo->prepare("SELECT GREATEST(COALESCE(MAX(UNIX_TIMESTAMP(UPDATE_TIME)), 1), COALESCE(MAX(UNIX_TIMESTAMP(CREATE_TIME)), 1)) AS `db_update_time` FROM `information_schema`.`tables`
+  WHERE (`TABLE_NAME` = 'filterconf' OR `TABLE_NAME` = 'settingsmap' OR `TABLE_NAME` = 'sogo_quick_contact' OR `TABLE_NAME` = 'alias')
     AND TABLE_SCHEMA = :dbname;");
 $stmt->execute(array(
   ':dbname' => $database_name
@@ -43,12 +42,35 @@ if (isset($_SERVER['HTTP_IF_MODIFIED_SINCE']) && (strtotime($_SERVER['HTTP_IF_MO
 } else {
   header('Last-Modified: '.gmdate('D, d M Y H:i:s', $db_update_time).' GMT', true, 200);
 }
-*/
 
 function parse_email($email) {
   if (!filter_var($email, FILTER_VALIDATE_EMAIL)) return false;
   $a = strrpos($email, '@');
   return array('local' => substr($email, 0, $a), 'domain' => substr($email, $a));
+}
+
+function normalize_email($email) {
+  $email = strtolower(str_replace('/', '\/', $email));
+  $gm = "@gmail.com";
+  if (substr_compare($email, $gm, -strlen($gm)) == 0) {
+    $email = explode('@', $email);
+    $email[0] = str_replace('.', '', $email[0]);
+    $email = implode('@', $email);
+  }
+  $gm_alt = "@googlemail.com";
+  if (substr_compare($email, $gm_alt, -strlen($gm_alt)) == 0) {
+    $email = explode('@', $email);
+    $email[0] = str_replace('.', '', $email[0]);
+    $email[1] = str_replace('@', '', $gm);
+    $email = implode('@', $email);
+  }
+  if (str_contains($email, "+")) {
+    $email = explode('@', $email);
+    $user = explode('+', $email[0]);
+    $email[0] = $user[0];
+    $email = implode('@', $email);
+  }
+  return $email;
 }
 
 function wl_by_sogo() {
@@ -65,7 +87,7 @@ function wl_by_sogo() {
       }
       // Explicit from, no mime_from, no regex - envelope must match
       // mailcow white and blacklists also cover mime_from
-      $rcpt[$row['user']][] = str_replace('/', '\/', $contact);
+      $rcpt[$row['user']][] = normalize_email($contact);
     }
   }
   return $rcpt;
@@ -92,7 +114,7 @@ function ucl_rcpts($object, $type) {
       $rcpt[] = str_replace('/', '\/', $row['address']);
     }
     // Aliases by alias domains
-    $stmt = $pdo->prepare("SELECT CONCAT(`local_part`, '@', `alias_domain`.`alias_domain`) AS `alias` FROM `mailbox` 
+    $stmt = $pdo->prepare("SELECT CONCAT(`local_part`, '@', `alias_domain`.`alias_domain`) AS `alias` FROM `mailbox`
       LEFT OUTER JOIN `alias_domain` ON `mailbox`.`domain` = `alias_domain`.`target_domain`
       WHERE `mailbox`.`username` = :object");
     $stmt->execute(array(
@@ -162,7 +184,7 @@ while ($row = array_shift($rows)) {
     rcpt = <?=json_encode($rcpt, JSON_UNESCAPED_SLASHES);?>;
 <?php
   }
-  $stmt = $pdo->prepare("SELECT `option`, `value` FROM `filterconf` 
+  $stmt = $pdo->prepare("SELECT `option`, `value` FROM `filterconf`
     WHERE (`option` = 'highspamlevel' OR `option` = 'lowspamlevel')
       AND `object`= :object");
   $stmt->execute(array(':object' => $row['object']));
@@ -394,13 +416,8 @@ while ($row = array_shift($rows)) {
 */
 
 ?>
-  traps {
+  ham_trap {
 <?php
-  foreach (ucl_rcpts('spam@localhost', 'mailbox') as $rcpt) {
-?>
-    rcpt = <?=json_encode($rcpt, JSON_UNESCAPED_SLASHES);?>;
-<?php
-  }
   foreach (ucl_rcpts('ham@localhost', 'mailbox') as $rcpt) {
 ?>
     rcpt = <?=json_encode($rcpt, JSON_UNESCAPED_SLASHES);?>;
@@ -408,7 +425,29 @@ while ($row = array_shift($rows)) {
   }
 ?>
     priority = 9;
-    want_spam = yes;
+    apply "default" {
+      symbols_enabled = ["HISTORY_SAVE"];
+    }
+    symbols [
+      "HAM_TRAP"
+    ]
+  }
+
+  spam_trap {
+<?php
+  foreach (ucl_rcpts('spam@localhost', 'mailbox') as $rcpt) {
+?>
+    rcpt = <?=json_encode($rcpt, JSON_UNESCAPED_SLASHES);?>;
+<?php
+  }
+?>
+    priority = 9;
+    apply "default" {
+      symbols_enabled = ["HISTORY_SAVE"];
+    }
+    symbols [
+      "SPAM_TRAP"
+    ]
   }
 <?php
 // Start additional content
@@ -429,4 +468,36 @@ while ($row = array_shift($rows)) {
 <?php
 }
 ?>
+
+<?php
+// Start internal aliases
+
+$stmt = $pdo->query("SELECT `id`, `address`, `domain` FROM `alias` WHERE `active` = '1' AND `internal` = '1'");
+$aliases = $stmt->fetchAll(PDO::FETCH_ASSOC);
+while ($alias = array_shift($aliases)) {
+  // build allowed_domains regex and add target domain and alias domains
+  $stmt = $pdo->prepare("SELECT `alias_domain` FROM `alias_domain` WHERE `active` = '1' AND `target_domain` = :target_domain");
+  $stmt->execute(array(':target_domain' => $alias['domain']));
+  $allowed_domains = $stmt->fetchAll(PDO::FETCH_ASSOC);
+  $allowed_domains = array_map(function($item) {
+    return str_replace('.', '\.', $item['alias_domain']);
+  }, $allowed_domains);
+  $allowed_domains[] = str_replace('.', '\.', $alias['domain']);
+  $allowed_domains = implode('|', $allowed_domains);
+?>
+  internal_alias_<?=$alias['id'];?> {
+    priority = 10;
+    rcpt = "<?=$alias['address'];?>";
+    from = "/^((?!.*@(<?=$allowed_domains;?>)).)*$/";
+    apply "default" {
+      MAILCOW_INTERNAL_ALIAS = 9999.0;
+    }
+    symbols [
+      "MAILCOW_INTERNAL_ALIAS"
+    ]
+  }
+<?php
+}
+?>
+
 }

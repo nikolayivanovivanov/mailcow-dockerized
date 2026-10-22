@@ -1,14 +1,23 @@
-FROM php:7.4-fpm-alpine3.11
-LABEL maintainer "Andre Peters <andre.peters@servercow.de>"
+FROM php:8.2-fpm-alpine3.24
 
-ENV APCU_PECL 5.1.18
-ENV IMAGICK_PECL 3.4.4
-# Mailparse is pulled from master branch
-#ENV MAILPARSE_PECL 3.0.2
-ENV MEMCACHED_PECL 3.1.5
-ENV REDIS_PECL 5.2.1
+LABEL maintainer = "The Infrastructure Company GmbH <info@servercow.de>"
+
+# renovate: datasource=github-tags depName=krakjoe/apcu versioning=semver-coerced extractVersion=^v(?<version>.*)$
+ARG APCU_PECL_VERSION=5.1.28
+# renovate: datasource=github-tags depName=Imagick/imagick versioning=semver-coerced extractVersion=(?<version>.*)$
+ARG IMAGICK_PECL_VERSION=3.8.1
+# renovate: datasource=github-tags depName=php/pecl-mail-mailparse versioning=semver-coerced extractVersion=^v(?<version>.*)$
+ARG MAILPARSE_PECL_VERSION=3.2.0
+# renovate: datasource=github-tags depName=php-memcached-dev/php-memcached versioning=semver-coerced extractVersion=^v(?<version>.*)$
+ARG MEMCACHED_PECL_VERSION=3.4.0
+# renovate: datasource=github-tags depName=phpredis/phpredis versioning=semver-coerced extractVersion=(?<version>.*)$
+ARG REDIS_PECL_VERSION=6.3.0
+# renovate: datasource=github-tags depName=composer/composer versioning=semver-coerced extractVersion=(?<version>.*)$
+ARG COMPOSER_VERSION=2.10.2
 
 RUN apk add -U --no-cache autoconf \
+  aspell-dev \
+  aspell-libs \
   bash \
   c-client \
   cyrus-sasl-dev \
@@ -16,6 +25,7 @@ RUN apk add -U --no-cache autoconf \
   freetype-dev \
   g++ \
   git \
+  gettext \
   gettext-dev \
   gmp-dev \
   gnupg \
@@ -25,8 +35,11 @@ RUN apk add -U --no-cache autoconf \
   imagemagick-dev \
   imap-dev \
   jq \
+  libavif \
+  libavif-dev \
   libjpeg-turbo \
   libjpeg-turbo-dev \
+  libmemcached \
   libmemcached-dev \
   libpng \
   libpng-dev \
@@ -34,10 +47,14 @@ RUN apk add -U --no-cache autoconf \
   libressl-dev \
   librsvg \
   libtool \
+  libwebp \
   libwebp-dev \
   libxml2-dev \
+  libxpm \
   libxpm-dev \
+  libzip \
   libzip-dev \
+  linux-headers \
   make \
   mysql-client \
   openldap-dev \
@@ -47,37 +64,51 @@ RUN apk add -U --no-cache autoconf \
   samba-client \
   zlib-dev \
   tzdata \
-  && git clone https://github.com/php/pecl-mail-mailparse \
-  && cd pecl-mail-mailparse \
-  && pecl install package.xml \
-  && cd .. \
-  && rm -r pecl-mail-mailparse \
-  && pecl install redis-${REDIS_PECL} memcached-${MEMCACHED_PECL} APCu-${APCU_PECL} imagick-${IMAGICK_PECL} \
-  && docker-php-ext-enable apcu imagick memcached mailparse redis \
-  && pecl clear-cache \
+  && docker-php-source extract \
+  # PECL extensions from their GitHub tags (pecl.php.net is not reliable enough for builds)
+  && mkdir -p /usr/src/php/ext/apcu /usr/src/php/ext/imagick /usr/src/php/ext/mailparse /usr/src/php/ext/memcached /usr/src/php/ext/redis \
+  && curl -fsSL https://github.com/krakjoe/apcu/archive/refs/tags/v${APCU_PECL_VERSION}.tar.gz | tar -xz --strip-components=1 -C /usr/src/php/ext/apcu \
+  && curl -fsSL https://github.com/Imagick/imagick/archive/refs/tags/${IMAGICK_PECL_VERSION}.tar.gz | tar -xz --strip-components=1 -C /usr/src/php/ext/imagick \
+  && sed -i "s/@PACKAGE_VERSION@/${IMAGICK_PECL_VERSION}/" /usr/src/php/ext/imagick/php_imagick.h \
+  && curl -fsSL https://github.com/php/pecl-mail-mailparse/archive/refs/tags/v${MAILPARSE_PECL_VERSION}.tar.gz | tar -xz --strip-components=1 -C /usr/src/php/ext/mailparse \
+  && curl -fsSL https://github.com/php-memcached-dev/php-memcached/archive/refs/tags/v${MEMCACHED_PECL_VERSION}.tar.gz | tar -xz --strip-components=1 -C /usr/src/php/ext/memcached \
+  && curl -fsSL https://github.com/phpredis/phpredis/archive/refs/tags/${REDIS_PECL_VERSION}.tar.gz | tar -xz --strip-components=1 -C /usr/src/php/ext/redis \
+  && docker-php-ext-install -j 4 apcu imagick mailparse memcached redis \
   && docker-php-ext-configure intl \
   && docker-php-ext-configure exif \
   && docker-php-ext-configure gd --with-freetype=/usr/include/ \  
     --with-jpeg=/usr/include/ \
-  && docker-php-ext-install -j 4 exif gd gettext intl ldap opcache pcntl pdo pdo_mysql soap sockets xmlrpc zip bcmath gmp \
+    --with-webp \
+    --with-xpm \
+    --with-avif \
+  && docker-php-ext-install -j 4 exif gd gettext intl ldap opcache pcntl pdo pdo_mysql pspell soap sockets zip bcmath gmp \
   && docker-php-ext-configure imap --with-imap --with-imap-ssl \
   && docker-php-ext-install -j 4 imap \
-  && curl --silent --show-error https://getcomposer.org/installer | php \
+  && curl --silent --show-error https://getcomposer.org/installer | php -- --version=${COMPOSER_VERSION} \
   && mv composer.phar /usr/local/bin/composer \
   && chmod +x /usr/local/bin/composer \
+  && docker-php-source delete \
   && apk del --purge autoconf \
+    aspell-dev \
     cyrus-sasl-dev \
     freetype-dev \
     g++ \
+    gettext-dev \
     icu-dev \
     imagemagick-dev \
     imap-dev \
+    libavif-dev \
     libjpeg-turbo-dev \
+    libmemcached-dev \
     libpng-dev \
     libressl-dev \
     libwebp-dev \
     libxml2-dev \
+    libxpm-dev \
+    libzip-dev \
+    linux-headers \
     make \
+    openldap-dev \
     pcre-dev \
     zlib-dev
 

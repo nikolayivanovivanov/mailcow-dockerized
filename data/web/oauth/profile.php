@@ -11,9 +11,11 @@ $stmt->execute(array(':username' => $token['user_id']));
 $mailbox = $stmt->fetch(PDO::FETCH_ASSOC);
 if (!empty($mailbox)) {
   if ($token['scope'] == 'profile') {
+    header('Content-Type: application/json');
     echo json_encode(array(
       'success' => true,
       'username' => $token['user_id'],
+      'id' => $token['user_id'],
       'identifier' => $token['user_id'],
       'email' => (!empty($mailbox['username']) ? $mailbox['username'] : ''),
       'full_name' => (!empty($mailbox['name']) ? $mailbox['name'] : 'mailcow administrative user'),

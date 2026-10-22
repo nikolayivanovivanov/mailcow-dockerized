@@ -20,6 +20,10 @@ if [[ "${TYPE}" != "rsa" ]]; then
   log_f "Unknown certificate type '${TYPE}' requested"
   exit 5
 fi
+
+if [[ "${ACME_DNS_CHALLENGE}" == "y" ]]; then
+  exec /srv/obtain-certificate-dns.sh "$@"
+fi
 DOMAINS_FILE=${ACME_BASE}/${CERT_DOMAIN}/domains
 CERT=${ACME_BASE}/${CERT_DOMAIN}/${PREFIX}cert.pem
 SHARED_KEY=${ACME_BASE}/acme/${PREFIX}key.pem  # must already exist
@@ -32,10 +36,14 @@ if [[ -z ${CERT_DOMAINS[*]} ]]; then
 fi
 
 if [[ "${LE_STAGING}" =~ ^([yY][eE][sS]|[yY])+$ ]]; then
+  if [[ ! -z "${DIRECTORY_URL}" ]]; then
+    log_f "Cannot use DIRECTORY_URL with LE_STAGING=y - ignoring DIRECTORY_URL"
+  fi
   log_f "Using Let's Encrypt staging servers"
-  STAGING_PARAMETER='--directory-url https://acme-staging-v02.api.letsencrypt.org/directory'
-else
-  STAGING_PARAMETER=
+  DIRECTORY_URL='--directory-url https://acme-staging-v02.api.letsencrypt.org/directory'
+elif [[ ! -z "${DIRECTORY_URL}" ]]; then
+  log_f "Using custom directory URL ${DIRECTORY_URL}"
+  DIRECTORY_URL="--directory-url ${DIRECTORY_URL}"
 fi
 
 if [[ -f ${DOMAINS_FILE} && "$(cat ${DOMAINS_FILE})" ==  "${CERT_DOMAINS[*]}" ]]; then
@@ -76,7 +84,7 @@ fi
 printf "[SAN]\nsubjectAltName=" > /tmp/_SAN
 printf "DNS:%s," "${CERT_DOMAINS[@]}" >> /tmp/_SAN
 sed -i '$s/,$//' /tmp/_SAN
-openssl req -new -sha256 -key ${KEY} -subj "/" -reqexts SAN -config <(cat /etc/ssl/openssl.cnf /tmp/_SAN) > ${CSR}
+openssl req -new -sha256 -key ${KEY} -subj "/" -reqexts SAN -config <(cat "$(openssl version -d | sed 's/.*"\(.*\)"/\1/g')/openssl.cnf" /tmp/_SAN) > ${CSR}
 
 # acme-tiny writes info to stderr and ceritifcate to stdout
 # The redirects will do the following:
@@ -84,7 +92,13 @@ openssl req -new -sha256 -key ${KEY} -subj "/" -reqexts SAN -config <(cat /etc/s
 # - redirect acme-tiny stderr to stdout (logs to variable ACME_RESPONSE)
 # - tee stderr to get live output and log to dockerd
 
-ACME_RESPONSE=$(acme-tiny ${STAGING_PARAMETER} \
+log_f "Checking resolver..."
+until dig letsencrypt.org +time=3 +tries=1 @unbound > /dev/null; do
+  sleep 2
+done
+log_f "Resolver OK"
+log_f "Using command acme-tiny ${DIRECTORY_URL} --account-key ${ACME_BASE}/acme/account.pem --disable-check --csr ${CSR} --acme-dir /var/www/acme/"
+ACME_RESPONSE=$(acme-tiny ${DIRECTORY_URL} \
   --account-key ${ACME_BASE}/acme/account.pem \
   --disable-check \
   --csr ${CSR} \
@@ -114,7 +128,7 @@ case "$SUCCESS" in
     ;;
   *) # non-zero is non-fun
     log_f "Failed to obtain certificate ${CERT} for domains '${CERT_DOMAINS[*]}'"
-    redis-cli -h redis SET ACME_FAIL_TIME "$(date +%s)"
+    redis-cli -h redis -a ${REDISPASS} --no-auth-warning SET ACME_FAIL_TIME "$(date +%s)"
     exit 100${SUCCESS}
     ;;
 esac

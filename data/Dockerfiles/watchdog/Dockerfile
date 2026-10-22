@@ -1,5 +1,6 @@
-FROM alpine:3.11
-LABEL maintainer "André Peters <andre.peters@servercow.de>"
+FROM alpine:3.23
+
+LABEL maintainer = "The Infrastructure Company GmbH <info@servercow.de>"
 
 # Installation
 RUN apk add --update \
@@ -15,7 +16,6 @@ RUN apk add --update \
   fcgi \
   openssl \
   nagios-plugins-mysql \
-  nagios-plugins-dns \
   nagios-plugins-disk \
   bind-tools \
   redis \
@@ -31,9 +31,12 @@ RUN apk add --update \
   tzdata \
   whois \
   && curl https://raw.githubusercontent.com/mludvig/smtp-cli/v3.10/smtp-cli -o /smtp-cli \
-  && chmod +x smtp-cli
+  && chmod +x smtp-cli \
+  && mkdir /usr/lib/mailcow
 
 COPY watchdog.sh /watchdog.sh
 COPY check_mysql_slavestatus.sh /usr/lib/nagios/plugins/check_mysql_slavestatus.sh
+COPY check_dns.sh /usr/lib/mailcow/check_dns.sh
+COPY client.cnf /etc/my.cnf.d/client.cnf
 
-CMD /watchdog.sh 2> /dev/null
+CMD ["/watchdog.sh"]

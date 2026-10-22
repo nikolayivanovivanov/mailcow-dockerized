@@ -8,7 +8,7 @@ fi
 
 # Cleaning up garbage
 echo "Cleaning up tmp files..."
-rm -rf /var/lib/clamav/clamav-*.tmp
+rm -rf /var/lib/clamav/tmp.*
 
 # Prepare whitelist
 
@@ -26,6 +26,7 @@ if [[ ! -f /var/lib/clamav/whitelist.ign2 ]]; then
 Example-Signature.Ignore-1
 PUA.Win.Trojan.EmbeddedPDF-1
 PUA.Pdf.Trojan.EmbeddedJavaScript-1
+PUA.Pdf.Trojan.OpenActionObjectwithJavascript-1
 EOF
 fi
 
@@ -90,6 +91,7 @@ done
 ) &
 BACKGROUND_TASKS+=($!)
 
+echo "$(clamd -V) is starting... please wait a moment."
 nice -n10 clamd &
 BACKGROUND_TASKS+=($!)
 

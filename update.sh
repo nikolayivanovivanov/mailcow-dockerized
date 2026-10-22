@@ -1,25 +1,84 @@
 #!/usr/bin/env bash
 
+############## Begin Function Section ##############
+
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+MAILCOW_CONF="${SCRIPT_DIR}/mailcow.conf"
+
+# Ensure the script is run from the directory that contains mailcow.conf
+if [ ! -f "${PWD}/mailcow.conf" ]; then
+  if [ -f "${SCRIPT_DIR}/mailcow.conf" ]; then
+    echo -e "\e[33mPlease run this script directly from the mailcow installation directory:\e[0m"
+    echo -e "  \e[36mcd ${SCRIPT_DIR} && ./update.sh\e[0m"
+    exit 1
+  else
+    echo -e "\e[31mmailcow.conf not found in current directory or script directory (\e[36m${SCRIPT_DIR}\e[31m).\e[0m"
+    echo -e "\e[33mRun this script directly from your mailcow installation directory.\e[0m"
+    exit 1
+  fi
+fi
+BRANCH="$(cd "${SCRIPT_DIR}" && git rev-parse --abbrev-ref HEAD)"
+
+# Check for --dev flag early to skip _modules update
+for arg in "$@"; do
+  if [[ "$arg" == "--dev" || "$arg" == "-d" ]]; then
+    echo -e "\e[32mRunning in Developer mode...\e[0m"
+    DEV=y
+    break
+  fi
+done
+
+MODULE_DIR="${SCRIPT_DIR}/_modules"
+
+if [ ! "$DEV" ]; then
+  # Calculate hash before fetch
+  if [[ -d "${MODULE_DIR}" && -n "$(ls -A "${MODULE_DIR}" 2>/dev/null)" ]]; then
+    MODULES_HASH_BEFORE=$(find "${MODULE_DIR}" -type f -exec sha256sum {} \; 2>/dev/null | sort | sha256sum | awk '{print $1}')
+  else
+    MODULES_HASH_BEFORE="EMPTY"
+  fi
+
+  echo -e "\e[33mFetching latest _modules from origin/${BRANCH}…\e[0m"
+  git fetch origin "${BRANCH}"
+  git checkout "origin/${BRANCH}" -- _modules
+
+  if [[ ! -d "${MODULE_DIR}" || -z "$(ls -A "${MODULE_DIR}")" ]]; then
+    echo -e "\e[31mError: _modules is still missing or empty after fetch!\e[0m"
+    exit 2
+  fi
+
+  # Calculate hash after fetch
+  MODULES_HASH_AFTER=$(find "${MODULE_DIR}" -type f -exec sha256sum {} \; 2>/dev/null | sort | sha256sum | awk '{print $1}')
+
+  # Check if modules changed
+  if [[ "${MODULES_HASH_BEFORE}" != "${MODULES_HASH_AFTER}" ]]; then
+    echo -e "\e[33m_modules have been updated. Please restart the update script.\e[0m"
+    exit 2
+  fi
+else
+  echo -e "\e[33mDeveloper mode: Skipping _modules update from git\e[0m"
+  if [[ ! -d "${MODULE_DIR}" || -z "$(ls -A "${MODULE_DIR}")" ]]; then
+    echo -e "\e[31mError: _modules directory is missing or empty!\e[0m"
+    exit 2
+  fi
+fi
+
+source _modules/scripts/core.sh
+source _modules/scripts/ipv6_controller.sh
+source _modules/scripts/new_options.sh
+source _modules/scripts/migrate_options.sh
+
+############## End Function Section ##############
+
 # Check permissions
 if [ "$(id -u)" -ne "0" ]; then
   echo "You need to be root"
   exit 1
 fi
 
-if [[ "$(uname -r)" =~ ^4\.15\.0-60 ]]; then
-  echo "DO NOT RUN mailcow ON THIS UBUNTU KERNEL!";
-  echo "Please update to 5.x or use another distribution."
-  exit 1
-fi
-
-if [[ "$(uname -r)" =~ ^4\.4\. ]]; then
-  if grep -q Ubuntu <<< $(uname -a); then
-    echo "DO NOT RUN mailcow ON THIS UBUNTU KERNEL!"
-    echo "Please update to linux-generic-hwe-16.04 by running \"apt-get install --install-recommends linux-generic-hwe-16.04\""
-    exit 1
-  fi
-  echo "mailcow on a 4.4.x kernel is not supported. It may or may not work, please upgrade your kernel or continue at your own risk."
-  read -p "Press any key to continue..." < /dev/tty
+# Run pre-update-hook
+if [ -f "${SCRIPT_DIR}/pre_update_hook.sh" ]; then
+  bash "${SCRIPT_DIR}/pre_update_hook.sh"
 fi
 
 # Exit on error and pipefail
@@ -33,97 +92,45 @@ PATH=$PATH:/opt/bin
 
 umask 0022
 
-for bin in curl docker-compose docker git awk sha1sum; do
-  if [[ -z $(which ${bin}) ]]; then echo "Cannot find ${bin}, exiting..."; exit 1; fi
-done
+# Unset COMPOSE_COMMAND and DOCKER_COMPOSE_VERSION Variable to be on the newest state.
+unset COMPOSE_COMMAND
+unset DOCKER_COMPOSE_VERSION
+
+get_installed_tools
+
+get_docker_version
 
 export LC_ALL=C
 DATE=$(date +%Y-%m-%d_%H_%M_%S)
-BRANCH=$(git rev-parse --abbrev-ref HEAD)
-
-check_online_status() {
-  CHECK_ONLINE_IPS=(1.1.1.1 9.9.9.9 8.8.8.8)
-  for ip in "${CHECK_ONLINE_IPS[@]}"; do
-    if timeout 3 ping -c 1 ${ip} > /dev/null; then
-      return 0
-    fi
-  done
-  return 1
-}
-
-prefetch_images() {
-  [[ -z ${BRANCH} ]] && { echo -e "\e[33m\nUnknown branch...\e[0m"; exit 1; }
-  git fetch origin #${BRANCH}
-  while read image; do
-    RET_C=0
-    until docker pull ${image}; do
-      RET_C=$((RET_C + 1))
-      echo -e "\e[33m\nError pulling $image, retrying...\e[0m"
-      [ ${RET_C} -gt 3 ] && { echo -e "\e[31m\nToo many failed retries, exiting\e[0m"; exit 1; }
-      sleep 1
-    done
-  done < <(git show origin/${BRANCH}:docker-compose.yml | grep "image:" | awk '{ gsub("image:","", $3); print $2 }')
-}
-
-docker_garbage() {
-  IMGS_TO_DELETE=()
-  for container in $(grep -oP "image: \Kmailcow.+" docker-compose.yml); do
-    REPOSITORY=${container/:*}
-    TAG=${container/*:}
-    V_MAIN=${container/*.}
-    V_SUB=${container/*.}
-    EXISTING_TAGS=$(docker images | grep ${REPOSITORY} | awk '{ print $2 }')
-    for existing_tag in ${EXISTING_TAGS[@]}; do
-      V_MAIN_EXISTING=${existing_tag/*.}
-      V_SUB_EXISTING=${existing_tag/*.}
-      # Not an integer
-      [[ ! $V_MAIN_EXISTING =~ ^[0-9]+$ ]] && continue
-      [[ ! $V_SUB_EXISTING =~ ^[0-9]+$ ]] && continue
-
-      if [[ $V_MAIN_EXISTING == "latest" ]]; then
-        echo "Found deprecated label \"latest\" for repository $REPOSITORY, it should be deleted."
-        IMGS_TO_DELETE+=($REPOSITORY:$existing_tag)
-      elif [[ $V_MAIN_EXISTING -lt $V_MAIN ]]; then
-        echo "Found tag $existing_tag for $REPOSITORY, which is older than the current tag $TAG and should be deleted."
-        IMGS_TO_DELETE+=($REPOSITORY:$existing_tag)
-      elif [[ $V_SUB_EXISTING -lt $V_SUB ]]; then
-        echo "Found tag $existing_tag for $REPOSITORY, which is older than the current tag $TAG and should be deleted."
-        IMGS_TO_DELETE+=($REPOSITORY:$existing_tag)
-      fi
-    done
-  done
-
-  if [[ ! -z ${IMGS_TO_DELETE[*]} ]]; then
-    echo "Run the following command to delete unused image tags:"
-    echo
-    echo "    docker rmi ${IMGS_TO_DELETE[*]}"
-    echo
-    if [ ! $FORCE ]; then
-      read -r -p "Do you want to delete old image tags right now? [y/N] " response
-      if [[ "$response" =~ ^([yY][eE][sS]|[yY])+$ ]]; then
-        docker rmi ${IMGS_TO_DELETE[*]}
-      else
-        echo "OK, skipped."
-      fi
-    else
-      echo "Skipped image removal because of force mode."
-    fi
-  fi
-  echo -e "\e[32mFurther cleanup...\e[0m"
-  echo "If you want to cleanup further garbage collected by Docker, please make sure all containers are up and running before cleaning your system by executing \"docker system prune\""
-}
+BRANCH="$(cd "${SCRIPT_DIR}"; git rev-parse --abbrev-ref HEAD)"
 
 while (($#)); do
   case "${1}" in
     --check|-c)
       echo "Checking remote code for updates..."
-      LATEST_REV=$(git ls-remote --exit-code --refs --quiet https://github.com/mailcow/mailcow-dockerized ${BRANCH} | cut -f1)
-      if [ $? -ne 0 ]; then
+      LATEST_REV=$(git ls-remote --exit-code --refs --quiet https://github.com/mailcow/mailcow-dockerized "${BRANCH}" | cut -f1)
+      if [ "$?" -ne 0 ]; then
         echo "A problem occurred while trying to fetch the latest revision from github."
         exit 99
       fi
       if [[ -z $(git log HEAD --pretty=format:"%H" | grep "${LATEST_REV}") ]]; then
-        echo "Updated code is available."
+        echo -e "Updated code is available.\nThe changes can be found here: https://github.com/mailcow/mailcow-dockerized/commits/master"
+        git log --date=short --pretty=format:"%ad - %s" "$(git rev-parse --short HEAD)"..origin/master
+        exit 0
+      else
+        echo "No updates available."
+        exit 3
+      fi
+    ;;
+    --check-tags)
+      echo "Checking remote tags for updates..."
+      LATEST_TAG_REV=$(git ls-remote --exit-code --quiet --tags origin | tail -1 | cut -f1)
+      if [ "$?" -ne 0 ]; then
+        echo "A problem occurred while trying to fetch the latest tag from github."
+        exit 99
+      fi
+      if [[ -z $(git log HEAD --pretty=format:"%H" | grep "${LATEST_TAG_REV}") ]]; then
+        echo -e "New tag is available.\nThe changes can be found here: https://github.com/mailcow/mailcow-dockerized/releases/latest"
         exit 0
       else
         echo "No updates available."
@@ -136,10 +143,21 @@ while (($#)); do
     --skip-start)
       SKIP_START=y
     ;;
+    --skip-ping-check)
+      SKIP_PING_CHECK=y
+    ;;
+    --stable)
+      CURRENT_BRANCH="$(cd "${SCRIPT_DIR}"; git rev-parse --abbrev-ref HEAD)"
+      NEW_BRANCH="master"
+    ;;
     --gc)
       echo -e "\e[32mCollecting garbage...\e[0m"
       docker_garbage
       exit 0
+    ;;
+    --nightly)
+      CURRENT_BRANCH="$(cd "${SCRIPT_DIR}"; git rev-parse --abbrev-ref HEAD)"
+      NEW_BRANCH="nightly"
     ;;
     --prefetch)
       echo -e "\e[32mPrefetching images...\e[0m"
@@ -147,275 +165,219 @@ while (($#)); do
       exit 0
     ;;
     -f|--force)
-      echo -e "\e[32mForcing Update...\e[0m"
+      echo -e "\e[32mRunning in forced mode...\e[0m"
       FORCE=y
     ;;
-    --no-update-compose)
-      NO_UPDATE_COMPOSE=y
+    -d|--dev)
+      # Already handled at the top of the script before _modules update
+    ;;
+    --legacy)
+      CURRENT_BRANCH="$(cd "${SCRIPT_DIR}"; git rev-parse --abbrev-ref HEAD)"
+      NEW_BRANCH="legacy"
     ;;
     --help|-h)
-    echo './update.sh [-c|--check, --ours, --gc, --skip-start, -h|--help]
+    echo './update.sh [-c|--check, --check-tags, --ours, --gc, --nightly, --prefetch, --skip-start, --skip-ping-check, --stable, --legacy, -f|--force, -d|--dev, -h|--help]
 
   -c|--check           -   Check for updates and exit (exit codes => 0: update available, 3: no updates)
+  --check-tags         -   Check for newer tags and exit (exit codes => 0: newer tag available, 3: no newer tag)
   --ours               -   Use merge strategy option "ours" to solve conflicts in favor of non-mailcow code (local changes over remote changes), not recommended!
   --gc                 -   Run garbage collector to delete old image tags
-  --no-update-compose  -   Do not update docker-compose
+  --nightly            -   Switch your mailcow updates to the unstable (nightly) branch. FOR TESTING PURPOSES ONLY!!!!
   --prefetch           -   Only prefetch new images and exit (useful to prepare updates)
   --skip-start         -   Do not start mailcow after update
+  --skip-ping-check    -   Skip ICMP Check to public DNS resolvers (Use it only if you'\''ve blocked any ICMP Connections to your mailcow machine)
+  --stable             -   Switch your mailcow updates to the stable (master) branch. Default unless you changed it with --nightly or --legacy.
+  --legacy             -   Switch your mailcow updates to the legacy branch. The legacy branch will only receive security updates until February 2026.
   -f|--force           -   Force update, do not ask questions
+  -d|--dev             -   Enables Developer Mode (No Checkout of update.sh for tests)
 '
-    exit 1
+    exit 0
   esac
   shift
 done
 
-[[ ! -f mailcow.conf ]] && { echo "mailcow.conf is missing"; exit 1;}
+[[ ! -f mailcow.conf ]] && { echo -e "\e[31mmailcow.conf is missing! Is mailcow installed?\e[0m"; exit 1;}
+
 chmod 600 mailcow.conf
 source mailcow.conf
+
+get_compose_type
+
 DOTS=${MAILCOW_HOSTNAME//[^.]};
-if [ ${#DOTS} -lt 2 ]; then
-  echo "MAILCOW_HOSTNAME (${MAILCOW_HOSTNAME}) is not a FQDN!"
-  echo "Please change it to a FQDN and run docker-compose down followed by docker-compose up -d"
+if [ ${#DOTS} -lt 1 ]; then
+  echo -e "\e[31mMAILCOW_HOSTNAME (${MAILCOW_HOSTNAME}) is not a FQDN!\e[0m"
+  sleep 1
+  echo "Please change it to a FQDN and redeploy the stack with $COMPOSE_COMMAND up -d"
   exit 1
+elif [[ "${MAILCOW_HOSTNAME: -1}" == "." ]]; then
+  echo "MAILCOW_HOSTNAME (${MAILCOW_HOSTNAME}) is ending with a dot. This is not a valid FQDN!"
+  exit 1
+elif [ ${#DOTS} -eq 1 ]; then
+  echo -e "\e[33mMAILCOW_HOSTNAME (${MAILCOW_HOSTNAME}) does not contain a Subdomain. This is not fully tested and may cause issues.\e[0m"
+  echo "Find more information about why this message exists here: https://github.com/mailcow/mailcow-dockerized/issues/1572"
+  read -r -p "Do you want to proceed anyway? [y/N] " response
+  if [[ "$response" =~ ^([yY][eE][sS]|[yY])+$ ]]; then
+    echo "OK. Proceeding."
+  else
+    echo "OK. Exiting."
+    exit 1
+  fi
 fi
 
-if grep --help 2>&1 | head -n 1 | grep -q -i "busybox"; then echo "BusybBox grep detected, please install gnu grep, \"apk add --no-cache --upgrade grep\""; exit 1; fi
-if cp --help 2>&1 | head -n 1 | grep -q -i "busybox"; then echo "BusybBox cp detected, please install coreutils, \"apk add --no-cache --upgrade coreutils\""; exit 1; fi
+detect_bad_asn
 
-CONFIG_ARRAY=(
-  "SKIP_LETS_ENCRYPT"
-  "SKIP_SOGO"
-  "USE_WATCHDOG"
-  "WATCHDOG_NOTIFY_EMAIL"
-  "WATCHDOG_NOTIFY_BAN"
-  "WATCHDOG_EXTERNAL_CHECKS"
-  "SKIP_CLAMD"
-  "SKIP_IP_CHECK"
-  "ADDITIONAL_SAN"
-  "DOVEADM_PORT"
-  "IPV4_NETWORK"
-  "IPV6_NETWORK"
-  "LOG_LINES"
-  "SNAT_TO_SOURCE"
-  "SNAT6_TO_SOURCE"
-  "COMPOSE_PROJECT_NAME"
-  "SQL_PORT"
-  "API_KEY"
-  "API_KEY_READ_ONLY"
-  "API_ALLOW_FROM"
-  "MAILDIR_GC_TIME"
-  "MAILDIR_SUB"
-  "ACL_ANYONE"
-  "SOLR_HEAP"
-  "SKIP_SOLR"
-  "ENABLE_SSL_SNI"
-  "ALLOW_ADMIN_EMAIL_LOGIN"
-  "SKIP_HTTP_VERIFICATION"
-  "SOGO_EXPIRE_SESSION"
-  "REDIS_PORT"
-)
+if [[ ("${SKIP_PING_CHECK}" == "y") ]]; then
+echo -e "\e[32mSkipping Ping Check...\e[0m"
 
-sed -i '$a\' mailcow.conf
-for option in ${CONFIG_ARRAY[@]}; do
-  if [[ ${option} == "ADDITIONAL_SAN" ]]; then
-    if ! grep -q ${option} mailcow.conf; then
-      echo "Adding new option \"${option}\" to mailcow.conf"
-      echo "${option}=" >> mailcow.conf
-    fi
-  elif [[ ${option} == "COMPOSE_PROJECT_NAME" ]]; then
-    if ! grep -q ${option} mailcow.conf; then
-      echo "Adding new option \"${option}\" to mailcow.conf"
-      echo "COMPOSE_PROJECT_NAME=mailcowdockerized" >> mailcow.conf
-    fi
-  elif [[ ${option} == "DOVEADM_PORT" ]]; then
-    if ! grep -q ${option} mailcow.conf; then
-      echo "Adding new option \"${option}\" to mailcow.conf"
-      echo "DOVEADM_PORT=127.0.0.1:19991" >> mailcow.conf
-    fi
-  elif [[ ${option} == "WATCHDOG_NOTIFY_EMAIL" ]]; then
-    if ! grep -q ${option} mailcow.conf; then
-      echo "Adding new option \"${option}\" to mailcow.conf"
-      echo "WATCHDOG_NOTIFY_EMAIL=" >> mailcow.conf
-    fi
-  elif [[ ${option} == "LOG_LINES" ]]; then
-    if ! grep -q ${option} mailcow.conf; then
-      echo "Adding new option \"${option}\" to mailcow.conf"
-      echo '# Max log lines per service to keep in Redis logs' >> mailcow.conf
-      echo "LOG_LINES=9999" >> mailcow.conf
-    fi
-  elif [[ ${option} == "IPV4_NETWORK" ]]; then
-    if ! grep -q ${option} mailcow.conf; then
-      echo "Adding new option \"${option}\" to mailcow.conf"
-      echo '# Internal IPv4 /24 subnet, format n.n.n. (expands to n.n.n.0/24)' >> mailcow.conf
-      echo "IPV4_NETWORK=172.22.1" >> mailcow.conf
-    fi
-  elif [[ ${option} == "IPV6_NETWORK" ]]; then
-    if ! grep -q ${option} mailcow.conf; then
-      echo "Adding new option \"${option}\" to mailcow.conf"
-      echo '# Internal IPv6 subnet in fc00::/7' >> mailcow.conf
-      echo "IPV6_NETWORK=fd4d:6169:6c63:6f77::/64" >> mailcow.conf
-    fi
-  elif [[ ${option} == "SQL_PORT" ]]; then
-    if ! grep -q ${option} mailcow.conf; then
-      echo "Adding new option \"${option}\" to mailcow.conf"
-      echo '# Bind SQL to 127.0.0.1 on port 13306' >> mailcow.conf
-      echo "SQL_PORT=127.0.0.1:13306" >> mailcow.conf
-    fi
-  elif [[ ${option} == "API_KEY" ]]; then
-    if ! grep -q ${option} mailcow.conf; then
-      echo "Adding new option \"${option}\" to mailcow.conf"
-      echo '# Create or override API key for web UI' >> mailcow.conf
-      echo "#API_KEY=" >> mailcow.conf
-    fi
-  elif [[ ${option} == "API_KEY_READ_ONLY" ]]; then
-    if ! grep -q ${option} mailcow.conf; then
-      echo "Adding new option \"${option}\" to mailcow.conf"
-      echo '# Create or override read-only API key for web UI' >> mailcow.conf
-      echo "#API_KEY_READ_ONLY=" >> mailcow.conf
-    fi
-  elif [[ ${option} == "API_ALLOW_FROM" ]]; then
-    if ! grep -q ${option} mailcow.conf; then
-      echo "Adding new option \"${option}\" to mailcow.conf"
-      echo '# Must be set for API_KEY to be active' >> mailcow.conf
-      echo '# IPs only, no networks (networks can be set via UI)' >> mailcow.conf
-      echo "#API_ALLOW_FROM=" >> mailcow.conf
-    fi
-  elif [[ ${option} == "SNAT_TO_SOURCE" ]]; then
-    if ! grep -q ${option} mailcow.conf; then
-      echo "Adding new option \"${option}\" to mailcow.conf"
-      echo '# Use this IPv4 for outgoing connections (SNAT)' >> mailcow.conf
-      echo "#SNAT_TO_SOURCE=" >> mailcow.conf
-    fi
-  elif [[ ${option} == "SNAT6_TO_SOURCE" ]]; then
-    if ! grep -q ${option} mailcow.conf; then
-      echo "Adding new option \"${option}\" to mailcow.conf"
-      echo '# Use this IPv6 for outgoing connections (SNAT)' >> mailcow.conf
-      echo "#SNAT6_TO_SOURCE=" >> mailcow.conf
-    fi
-  elif [[ ${option} == "MAILDIR_GC_TIME" ]]; then
-    if ! grep -q ${option} mailcow.conf; then
-      echo "Adding new option \"${option}\" to mailcow.conf"
-      echo '# Garbage collector cleanup' >> mailcow.conf
-      echo '# Deleted domains and mailboxes are moved to /var/vmail/_garbage/timestamp_sanitizedstring' >> mailcow.conf
-      echo '# How long should objects remain in the garbage until they are being deleted? (value in minutes)' >> mailcow.conf
-      echo '# Check interval is hourly' >> mailcow.conf
-      echo 'MAILDIR_GC_TIME=1440' >> mailcow.conf
-    fi
-  elif [[ ${option} == "ACL_ANYONE" ]]; then
-    if ! grep -q ${option} mailcow.conf; then
-      echo "Adding new option \"${option}\" to mailcow.conf"
-      echo '# Set this to "allow" to enable the anyone pseudo user. Disabled by default.' >> mailcow.conf
-      echo '# When enabled, ACL can be created, that apply to "All authenticated users"' >> mailcow.conf
-      echo '# This should probably only be activated on mail hosts, that are used exclusivly by one organisation.' >> mailcow.conf
-      echo '# Otherwise a user might share data with too many other users.' >> mailcow.conf
-      echo 'ACL_ANYONE=disallow' >> mailcow.conf
-    fi
-  elif [[ ${option} == "SOLR_HEAP" ]]; then
-    if ! grep -q ${option} mailcow.conf; then
-      echo "Adding new option \"${option}\" to mailcow.conf"
-      echo '# Solr heap size, there is no recommendation, please see Solr docs.' >> mailcow.conf
-      echo '# Solr is a prone to run OOM on large systems and should be monitored. Unmonitored Solr setups are not recommended.' >> mailcow.conf
-      echo '# Solr will refuse to start with total system memory below or equal to 2 GB.' >> mailcow.conf
-      echo "SOLR_HEAP=1024" >> mailcow.conf
-  fi
-  elif [[ ${option} == "SKIP_SOLR" ]]; then
-    if ! grep -q ${option} mailcow.conf; then
-      echo "Adding new option \"${option}\" to mailcow.conf"
-      echo '# Solr is disabled by default after upgrading from non-Solr to Solr-enabled mailcows.' >> mailcow.conf
-      echo '# Disable Solr or if you do not want to store a readable index of your mails in solr-vol-1.' >> mailcow.conf
-      echo "SKIP_SOLR=y" >> mailcow.conf
-    fi
-  elif [[ ${option} == "ENABLE_SSL_SNI" ]]; then
-    if ! grep -q ${option} mailcow.conf; then
-      echo "Adding new option \"${option}\" to mailcow.conf"
-      echo '# Create seperate certificates for all domains - y/n' >> mailcow.conf
-      echo '# this will allow adding more than 100 domains, but some email clients will not be able to connect with alternative hostnames' >> mailcow.conf
-      echo '# see https://wiki.dovecot.org/SSL/SNIClientSupport' >> mailcow.conf
-      echo "ENABLE_SSL_SNI=n" >> mailcow.conf
-    fi
-  elif [[ ${option} == "SKIP_SOGO" ]]; then
-    if ! grep -q ${option} mailcow.conf; then
-      echo "Adding new option \"${option}\" to mailcow.conf"
-      echo '# Skip SOGo: Will disable SOGo integration and therefore webmail, DAV protocols and ActiveSync support (experimental, unsupported, not fully implemented) - y/n' >> mailcow.conf
-      echo "SKIP_SOGO=n" >> mailcow.conf
-    fi
-  elif [[ ${option} == "MAILDIR_SUB" ]]; then
-    if ! grep -q ${option} mailcow.conf; then
-      echo "Adding new option \"${option}\" to mailcow.conf"
-      echo '# MAILDIR_SUB defines a path in a users virtual home to keep the maildir in. Leave empty for updated setups.' >> mailcow.conf
-      echo "#MAILDIR_SUB=Maildir" >> mailcow.conf
-      echo "MAILDIR_SUB=" >> mailcow.conf
-  fi
-  elif [[ ${option} == "WATCHDOG_NOTIFY_BAN" ]]; then
-    if ! grep -q ${option} mailcow.conf; then
-      echo "Adding new option \"${option}\" to mailcow.conf"
-      echo '# Notify about banned IP. Includes whois lookup.' >> mailcow.conf
-      echo "WATCHDOG_NOTIFY_BAN=y" >> mailcow.conf
-  fi
-  elif [[ ${option} == "WATCHDOG_EXTERNAL_CHECKS" ]]; then
-    if ! grep -q ${option} mailcow.conf; then
-      echo "Adding new option \"${option}\" to mailcow.conf"
-      echo '# Checks if mailcow is an open relay. Requires a SAL. More checks will follow.' >> mailcow.conf
-      echo '# No data is collected. Opt-in and anonymous.' >> mailcow.conf
-      echo '# Will only work with unmodified mailcow setups.' >> mailcow.conf
-      echo "WATCHDOG_EXTERNAL_CHECKS=n" >> mailcow.conf
-  fi
-  elif [[ ${option} == "SOGO_EXPIRE_SESSION" ]]; then
-    if ! grep -q ${option} mailcow.conf; then
-      echo "Adding new option \"${option}\" to mailcow.conf"
-      echo '# SOGo session timeout in minutes' >> mailcow.conf
-      echo "SOGO_EXPIRE_SESSION=480" >> mailcow.conf
-  fi
-  elif [[ ${option} == "REDIS_PORT" ]]; then
-    if ! grep -q ${option} mailcow.conf; then
-      echo "Adding new option \"${option}\" to mailcow.conf"
-      echo "REDIS_PORT=127.0.0.1:7654" >> mailcow.conf
-  fi
-  elif ! grep -q ${option} mailcow.conf; then
-    echo "Adding new option \"${option}\" to mailcow.conf"
-    echo "${option}=n" >> mailcow.conf
-  fi
-done
-
-echo -en "Checking internet connection... "
-if ! check_online_status; then
-  echo -e "\e[31mfailed\e[0m"
-  exit 1
 else
-  echo -e "\e[32mOK\e[0m"
+   echo -en "Checking internet connection... "
+   if ! check_online_status; then
+      echo -e "\e[31mfailed\e[0m"
+      exit 1
+   else
+      echo -e "\e[32mOK\e[0m"
+   fi
 fi
 
-echo -e "\e[32mChecking for newer update script...\e[0m"
-SHA1_1=$(sha1sum update.sh)
-git fetch origin #${BRANCH}
-git checkout origin/${BRANCH} update.sh
-SHA1_2=$(sha1sum update.sh)
-if [[ ${SHA1_1} != ${SHA1_2} ]]; then
-  echo "update.sh changed, please run this script again, exiting."
-  chmod +x update.sh
-  exit 2
+if ! [ "$NEW_BRANCH" ]; then
+  echo -e "\e[33mDetecting which build your mailcow runs on...\e[0m"
+  sleep 1
+  if [ "${BRANCH}" == "master" ]; then
+    echo -e "\e[32mYou are receiving stable updates (master).\e[0m"
+    echo -e "\e[33mTo change that run the update.sh Script one time with the --nightly parameter to switch to nightly builds.\e[0m"
+
+  elif [ "${BRANCH}" == "nightly" ]; then
+    echo -e "\e[31mYou are receiving unstable updates (nightly). These are for testing purposes only!!!\e[0m"
+    sleep 1
+    echo -e "\e[33mTo change that run the update.sh Script one time with the --stable parameter to switch to stable builds.\e[0m"
+
+  elif [ "${BRANCH}" == "legacy" ]; then
+    echo -e "\e[31mYou are receiving legacy updates. The legacy branch will only receive security updates until February 2026.\e[0m"
+    sleep 1
+    echo -e "\e[33mTo change that run the update.sh Script one time with the --stable parameter to switch to stable builds.\e[0m"
+
+  else
+    echo -e "\e[33mYou are receiving updates from an unsupported branch.\e[0m"
+    sleep 1
+    echo -e "\e[33mThe mailcow stack might still work but it is recommended to switch to the master branch (stable builds).\e[0m"
+    echo -e "\e[33mTo change that run the update.sh Script one time with the --stable parameter to switch to stable builds.\e[0m"
+  fi
+elif [ "$FORCE" ]; then
+  echo -e "\e[31mYou are running in forced mode!\e[0m"
+  echo -e "\e[31mA Branch Switch can only be performed manually (monitored).\e[0m"
+  echo -e "\e[31mPlease rerun the update.sh Script without the --force/-f parameter.\e[0m"
+  sleep 1
+elif [ "$NEW_BRANCH" == "master" ] && [ "$CURRENT_BRANCH" != "master" ]; then
+  echo -e "\e[33mYou are about to switch your mailcow updates to the stable (master) branch.\e[0m"
+  sleep 1
+  echo -e "\e[33mBefore you do: Please take a backup of all components to ensure that no data is lost...\e[0m"
+  sleep 1
+  echo -e "\e[31mWARNING: Please see on GitHub or ask in the community if a switch to master is stable or not.
+  In some rear cases an update back to master can destroy your mailcow configuration such as database upgrade, etc.
+  Normally an upgrade back to master should be safe during each full release.
+  Check GitHub for Database changes and update only if there similar to the full release!\e[0m"
+  read -r -p "Are you sure you that want to continue upgrading to the stable (master) branch? [y/N] " response
+  if [[ ! "${response}" =~ ^([yY][eE][sS]|[yY])+$ ]]; then
+    echo "OK. If you prepared yourself for that please run the update.sh Script with the --stable parameter again to trigger this process here."
+    exit 0
+  fi
+  BRANCH="$NEW_BRANCH"
+  DIFF_DIRECTORY=update_diffs
+  DIFF_FILE="${DIFF_DIRECTORY}/diff_before_upgrade_to_master_$(date +"%Y-%m-%d-%H-%M-%S")"
+  mv diff_before_upgrade* "${DIFF_DIRECTORY}/" 2> /dev/null
+  if ! git diff-index --quiet HEAD; then
+    echo -e "\e[32mSaving diff to ${DIFF_FILE}...\e[0m"
+    mkdir -p "${DIFF_DIRECTORY}"
+    git diff "${BRANCH}" --stat > "${DIFF_FILE}"
+    git diff "${BRANCH}" >> "${DIFF_FILE}"
+  fi
+  echo -e "\e[32mSwitching Branch to ${BRANCH}...\e[0m"
+  git fetch origin
+  git checkout -f "${BRANCH}"
+
+elif [ "$NEW_BRANCH" == "nightly" ] && [ "$CURRENT_BRANCH" != "nightly" ]; then
+  echo -e "\e[33mYou are about to switch your mailcow Updates to the unstable (nightly) branch.\e[0m"
+  sleep 1
+  echo -e "\e[33mBefore you do: Please take a backup of all components to ensure that no Data is lost...\e[0m"
+  sleep 1
+  echo -e "\e[31mWARNING: A switch to nightly is possible any time. But a switch back (to master) isn't.\e[0m"
+  read -r -p "Are you sure you that want to continue upgrading to the unstable (nightly) branch? [y/N] " response
+  if [[ ! "${response}" =~ ^([yY][eE][sS]|[yY])+$ ]]; then
+    echo "OK. If you prepared yourself for that please run the update.sh Script with the --nightly parameter again to trigger this process here."
+    exit 0
+  fi
+  BRANCH=$NEW_BRANCH
+  DIFF_DIRECTORY=update_diffs
+  DIFF_FILE=${DIFF_DIRECTORY}/diff_before_upgrade_to_nightly_$(date +"%Y-%m-%d-%H-%M-%S")
+  mv diff_before_upgrade* ${DIFF_DIRECTORY}/ 2> /dev/null
+  if ! git diff-index --quiet HEAD; then
+    echo -e "\e[32mSaving diff to ${DIFF_FILE}...\e[0m"
+    mkdir -p ${DIFF_DIRECTORY}
+    git diff "${BRANCH}" --stat > "${DIFF_FILE}"
+    git diff "${BRANCH}" >> "${DIFF_FILE}"
+  fi
+  git fetch origin
+  git checkout -f "${BRANCH}"
+elif [ "$NEW_BRANCH" == "legacy" ] && [ "$CURRENT_BRANCH" != "legacy" ]; then
+  echo -e "\e[33mYou are about to switch your mailcow Updates to the legacy branch.\e[0m"
+  sleep 1
+  echo -e "\e[33mBefore you do: Please take a backup of all components to ensure that no Data is lost...\e[0m"
+  sleep 1
+  echo -e "\e[31mWARNING: A switch to stable or nightly is possible any time.\e[0m"
+  read -r -p "Are you sure you want to continue upgrading to the legacy branch? [y/N] " response
+  if [[ ! "${response}" =~ ^([yY][eE][sS]|[yY])+$ ]]; then
+    echo "OK. If you prepared yourself for that please run the update.sh Script with the --legacy parameter again to trigger this process here."
+    exit 0
+  fi
+  BRANCH=$NEW_BRANCH
+  DIFF_DIRECTORY=update_diffs
+  DIFF_FILE=${DIFF_DIRECTORY}/diff_before_upgrade_to_legacy_$(date +"%Y-%m-%d-%H-%M-%S")
+  mv diff_before_upgrade* ${DIFF_DIRECTORY}/ 2> /dev/null
+  if ! git diff-index --quiet HEAD; then
+    echo -e "\e[32mSaving diff to ${DIFF_FILE}...\e[0m"
+    mkdir -p ${DIFF_DIRECTORY}
+    git diff "${BRANCH}" --stat > "${DIFF_FILE}"
+    git diff "${BRANCH}" >> "${DIFF_FILE}"
+  fi
+  git fetch origin
+  git checkout -f "${BRANCH}"
 fi
 
-if [[ -f mailcow.conf ]]; then
-  source mailcow.conf
-else
-  echo -e "\e[31mNo mailcow.conf - is mailcow installed?\e[0m"
-  exit 1
+if [ ! "$DEV" ]; then
+  EXIT_COUNT=0
+  echo -e "\e[32mChecking for newer update script...\e[0m"
+  SHA1_1="$(sha1sum update.sh)"
+  git fetch origin
+  git checkout "origin/${BRANCH}" -- update.sh
+  SHA1_2="$(sha1sum update.sh)"
+  if [[ "${SHA1_1}" != "${SHA1_2}" ]]; then
+    chmod +x update.sh
+    EXIT_COUNT+=1
+  fi
 fi
 
-if [ ! $FORCE ]; then
+if [ ! "$FORCE" ]; then
   read -r -p "Are you sure you want to update mailcow: dockerized? All containers will be stopped. [y/N] " response
-  if [[ ! "$response" =~ ^([yY][eE][sS]|[yY])+$ ]]; then
+  if [[ ! "${response}" =~ ^([yY][eE][sS]|[yY])+$ ]]; then
     echo "OK, exiting."
     exit 0
   fi
+  detect_major_update
 fi
 
 echo -e "\e[32mValidating docker-compose stack configuration...\e[0m"
-if ! docker-compose config -q; then
+sed -i 's/HTTPS_BIND:-:/HTTPS_BIND:-/g' docker-compose.yml
+sed -i 's/HTTP_BIND:-:/HTTP_BIND:-/g' docker-compose.yml
+if ! $COMPOSE_COMMAND config -q; then
   echo -e "\e[31m\nOh no, something went wrong. Please check the error message above.\e[0m"
   exit 1
 fi
+
+echo -e "\e[32mChecking for conflicting bridges...\e[0m"
+MAILCOW_BRIDGE=$($COMPOSE_COMMAND config | grep -i com.docker.network.bridge.name | cut -d':' -f2)
+while read NAT_ID; do
+  iptables -t nat -D POSTROUTING "$NAT_ID"
+done < <(iptables -L -vn -t nat --line-numbers | grep "$IPV4_NETWORK" | grep -E 'MASQUERADE.*all' | grep -v "${MAILCOW_BRIDGE}" | cut -d' ' -f1)
 
 DIFF_DIRECTORY=update_diffs
 DIFF_FILE=${DIFF_DIRECTORY}/diff_before_update_$(date +"%Y-%m-%d-%H-%M-%S")
@@ -423,8 +385,8 @@ mv diff_before_update* ${DIFF_DIRECTORY}/ 2> /dev/null
 if ! git diff-index --quiet HEAD; then
   echo -e "\e[32mSaving diff to ${DIFF_FILE}...\e[0m"
   mkdir -p ${DIFF_DIRECTORY}
-  git diff --stat > ${DIFF_FILE}
-  git diff >> ${DIFF_FILE}
+  git diff --stat > "${DIFF_FILE}"
+  git diff >> "${DIFF_FILE}"
 fi
 
 echo -e "\e[32mPrefetching images...\e[0m"
@@ -432,75 +394,76 @@ prefetch_images
 
 echo -e "\e[32mStopping mailcow...\e[0m"
 sleep 2
-MAILCOW_CONTAINERS=($(docker-compose ps -q))
-docker-compose down
+MAILCOW_CONTAINERS=($($COMPOSE_COMMAND ps -q))
+$COMPOSE_COMMAND down
 echo -e "\e[32mChecking for remaining containers...\e[0m"
 sleep 2
 for container in "${MAILCOW_CONTAINERS[@]}"; do
   docker rm -f "$container" 2> /dev/null
 done
 
-# Dont update from remote server and don't merge
-# Silently fixing remote url from andryyy to mailcow
-#git remote set-url origin https://github.com/mailcow/mailcow-dockerized
-#echo -e "\e[32mCommitting current status...\e[0m"
-#[[ -z "$(git config user.name)" ]] && git config user.name moo
-#[[ -z "$(git config user.email)" ]] && git config user.email moo@cow.moo
-#[[ ! -z $(git ls-files data/conf/rspamd/override.d/worker-controller-password.inc) ]] && git rm data/conf/rspamd/override.d/worker-controller-password.inc
-#git add -u
-#git commit -am "Before update on ${DATE}" > /dev/null
-#echo -e "\e[32mFetching updated code from remote...\e[0m"
-#git fetch origin #${BRANCH}
-#echo -e "\e[32mMerging local with remote code (recursive, strategy: \"${MERGE_STRATEGY:-theirs}\", options: \"patience\"...\e[0m"
-#git config merge.defaultToUpstream true
-#git merge -X${MERGE_STRATEGY:-theirs} -Xpatience -m "After update on ${DATE}"
-## Need to use a variable to not pass return codes of if checks
-#MERGE_RETURN=$?
-#if [[ ${MERGE_RETURN} == 128 ]]; then
-#  echo -e "\e[31m\nOh no, what happened?\n=> You most likely added files to your local mailcow instance that were now added to the official mailcow repository. Please move them to another location before updating mailcow.\e[0m"
-#  exit 1
-#elif [[ ${MERGE_RETURN} == 1 ]]; then
-#  echo -e "\e[93mPotenial conflict, trying to fix...\e[0m"
-#  git status --porcelain | grep -E "UD|DU" | awk '{print $2}' | xargs rm -v
-#  git add -A
-#  git commit -m "After update on ${DATE}" > /dev/null
-#  git checkout .
-#  echo -e "\e[32mRemoved and recreated files if necessary.\e[0m"
-#elif [[ ${MERGE_RETURN} != 0 ]]; then
-#  echo -e "\e[31m\nOh no, something went wrong. Please check the error message above.\e[0m"
-#  echo
-#  echo "Run docker-compose up -d to restart your stack without updates or try again after fixing the mentioned errors."
-#  exit 1
-#fi
+configure_ipv6
 
-if [[ ${NO_UPDATE_COMPOSE} == "y" ]]; then
-  echo -e "\e[33mNot fetching latest docker-compose, please check for updates manually!\e[0m"
-else
-  echo -e "\e[32mFetching new docker-compose version...\e[0m"
-  sleep 1
-  if [[ ! -z $(which pip) && $(pip list --local 2>&1 | grep -v DEPRECATION | grep -c docker-compose) == 1 ]]; then
-    true
-    #prevent breaking a working docker-compose installed with pip
-  elif [[ $(curl -sL -w "%{http_code}" https://www.servercow.de/docker-compose/latest.php -o /dev/null) == "200" ]]; then
-    LATEST_COMPOSE=$(curl -#L https://www.servercow.de/docker-compose/latest.php)
-    COMPOSE_VERSION=$(docker-compose version --short)
-    if [[ "$LATEST_COMPOSE" != "$COMPOSE_VERSION" ]]; then
-      COMPOSE_PATH=$(which docker-compose)
-      if [[ -w ${COMPOSE_PATH} ]]; then
-        curl -#L https://github.com/docker/compose/releases/download/${LATEST_COMPOSE}/docker-compose-$(uname -s)-$(uname -m) > $COMPOSE_PATH
-        chmod +x $COMPOSE_PATH
-      else
-        echo -e "\e[33mWARNING: $COMPOSE_PATH is not writable, but new version $LATEST_COMPOSE is available (installed: $COMPOSE_VERSION)\e[0m"
+[[ -f data/conf/nginx/ZZZ-ejabberd.conf ]] && rm data/conf/nginx/ZZZ-ejabberd.conf
+migrate_config_options
+adapt_new_options
+
+if [ ! "$DEV" ]; then
+  DEFAULT_REPO="https://github.com/mailcow/mailcow-dockerized"
+  CURRENT_REPO=$(git config --get remote.origin.url)
+  if [ "$CURRENT_REPO" != "$DEFAULT_REPO" ]; then
+    echo "The Repository currently used is not the default mailcow Repository."
+    echo "Currently Repository: $CURRENT_REPO"
+    echo "Default Repository:   $DEFAULT_REPO"
+    if [ ! "$FORCE" ]; then
+      read -r -p "Should it be changed back to default? [y/N] " repo_response
+      if [[ "$repo_response" =~ ^([yY][eE][sS]|[yY])+$ ]]; then
+        git remote set-url origin $DEFAULT_REPO
       fi
+    else
+        echo "Running in forced mode... setting Repo to default!"
+        git remote set-url origin $DEFAULT_REPO
     fi
-  else
-    echo -e "\e[33mCannot determine latest docker-compose version, skipping...\e[0m"
   fi
+fi
+
+if [ ! "$DEV" ]; then
+  echo -e "\e[32mCommitting current status...\e[0m"
+  [[ -z "$(git config user.name)" ]] && git config user.name moo
+  [[ -z "$(git config user.email)" ]] && git config user.email moo@cow.moo
+  [[ ! -z $(git ls-files data/conf/rspamd/override.d/worker-controller-password.inc) ]] && git rm data/conf/rspamd/override.d/worker-controller-password.inc
+  git add -u
+  git commit -am "Before update on ${DATE}" > /dev/null
+  echo -e "\e[32mFetching updated code from remote...\e[0m"
+  git fetch origin #${BRANCH}
+  echo -e "\e[32mMerging local with remote code (recursive, strategy: \"${MERGE_STRATEGY:-theirs}\", options: \"patience\"...\e[0m"
+  git config merge.defaultToUpstream true
+  git merge -X"${MERGE_STRATEGY:-theirs}" -Xpatience -m "After update on ${DATE}"
+  # Need to use a variable to not pass return codes of if checks
+  MERGE_RETURN=$?
+  if [[ ${MERGE_RETURN} == 128 ]]; then
+    echo -e "\e[31m\nOh no, what happened?\n=> You most likely added files to your local mailcow instance that were now added to the official mailcow repository. Please move them to another location before updating mailcow.\e[0m"
+    exit 1
+  elif [[ ${MERGE_RETURN} == 1 ]]; then
+    echo -e "\e[93mPotential conflict, trying to fix...\e[0m"
+    git status --porcelain | grep -E "UD|DU" | awk '{print $2}' | xargs rm -v
+    git add -A
+    git commit -m "After update on ${DATE}" > /dev/null
+    git checkout .
+    echo -e "\e[32mRemoved and recreated files if necessary.\e[0m"
+  elif [[ ${MERGE_RETURN} != 0 ]]; then
+    echo -e "\e[31m\nOh no, something went wrong. Please check the error message above.\e[0m"
+    echo
+    echo "Run $COMPOSE_COMMAND up -d to restart your stack without updates or try again after fixing the mentioned errors."
+    exit 1
+  fi
+else
+  echo -e "\e[33mDEVELOPER MODE: Not creating a git diff and commiting it to prevent development stuff within a backup diff...\e[0m"
 fi
 
 echo -e "\e[32mFetching new images, if any...\e[0m"
 sleep 2
-docker-compose pull
+$COMPOSE_COMMAND pull
 
 # Fix missing SSL, does not overwrite existing files
 [[ ! -d data/assets/ssl ]] && mkdir -p data/assets/ssl
@@ -512,7 +475,7 @@ if grep -q 'SYSCTL_IPV6_DISABLED=1' mailcow.conf; then
   echo '!! IMPORTANT !!'
   echo
   echo 'SYSCTL_IPV6_DISABLED was removed due to complications. IPv6 can be disabled by editing "docker-compose.yml" and setting "enable_ipv6: true" to "enable_ipv6: false".'
-  echo 'This setting will only be active after a complete shutdown of mailcow by running "docker-compose down" followed by "docker-compose up -d".'
+  echo "This setting will only be active after a complete shutdown of mailcow by running $COMPOSE_COMMAND down followed by $COMPOSE_COMMAND up -d."
   echo
   echo '!! IMPORTANT !!'
   echo
@@ -520,7 +483,7 @@ if grep -q 'SYSCTL_IPV6_DISABLED=1' mailcow.conf; then
 fi
 
 # Checking for old project name bug
-sed -i 's#COMPOSEPROJECT_NAME#COMPOSE_PROJECT_NAME#g' mailcow.conf
+sed -i --follow-symlinks 's#COMPOSEPROJECT_NAME#COMPOSE_PROJECT_NAME#g' mailcow.conf
 
 # Fix Rspamd maps
 if [ -f data/conf/rspamd/custom/global_from_blacklist.map ]; then
@@ -539,19 +502,65 @@ if [ -f "data/conf/rspamd/local.d/metrics.conf" ]; then
   mv data/conf/rspamd/local.d/metrics.conf data/conf/rspamd/local.d/metrics.conf_deprecated
 fi
 
+# Set app_info.inc.php
+if [ ${BRANCH} == "master" ]; then
+  mailcow_git_version=$(git describe --tags $(git rev-list --tags --max-count=1))
+elif [ ${BRANCH} == "nightly" ]; then
+  mailcow_git_version=$(git rev-parse --short $(git rev-parse @{upstream}))
+  mailcow_last_git_version=""
+else
+  mailcow_git_version=$(git rev-parse --short HEAD)
+  mailcow_last_git_version=""
+fi
+
+mailcow_git_commit=$(git rev-parse "origin/${BRANCH}")
+mailcow_git_commit_date=$(git log -1 --format=%ci @{upstream} )
+
+if [ $? -eq 0 ]; then
+  echo '<?php' > data/web/inc/app_info.inc.php
+  echo '  $MAILCOW_GIT_VERSION="'$mailcow_git_version'";' >> data/web/inc/app_info.inc.php
+  echo '  $MAILCOW_LAST_GIT_VERSION="";' >> data/web/inc/app_info.inc.php
+  echo '  $MAILCOW_GIT_OWNER="mailcow";' >> data/web/inc/app_info.inc.php
+  echo '  $MAILCOW_GIT_REPO="mailcow-dockerized";' >> data/web/inc/app_info.inc.php
+  echo '  $MAILCOW_GIT_URL="https://github.com/mailcow/mailcow-dockerized";' >> data/web/inc/app_info.inc.php
+  echo '  $MAILCOW_GIT_COMMIT="'$mailcow_git_commit'";' >> data/web/inc/app_info.inc.php
+  echo '  $MAILCOW_GIT_COMMIT_DATE="'$mailcow_git_commit_date'";' >> data/web/inc/app_info.inc.php
+  echo '  $MAILCOW_BRANCH="'$BRANCH'";' >> data/web/inc/app_info.inc.php
+  echo '  $MAILCOW_UPDATEDAT='$(date +%s)';' >> data/web/inc/app_info.inc.php
+  echo '?>' >> data/web/inc/app_info.inc.php
+else
+  echo '<?php' > data/web/inc/app_info.inc.php
+  echo '  $MAILCOW_GIT_VERSION="'$mailcow_git_version'";' >> data/web/inc/app_info.inc.php
+  echo '  $MAILCOW_LAST_GIT_VERSION="";' >> data/web/inc/app_info.inc.php
+  echo '  $MAILCOW_GIT_OWNER="mailcow";' >> data/web/inc/app_info.inc.php
+  echo '  $MAILCOW_GIT_REPO="mailcow-dockerized";' >> data/web/inc/app_info.inc.php
+  echo '  $MAILCOW_GIT_URL="https://github.com/mailcow/mailcow-dockerized";' >> data/web/inc/app_info.inc.php
+  echo '  $MAILCOW_GIT_COMMIT="";' >> data/web/inc/app_info.inc.php
+  echo '  $MAILCOW_GIT_COMMIT_DATE="";' >> data/web/inc/app_info.inc.php
+  echo '  $MAILCOW_BRANCH="'$BRANCH'";' >> data/web/inc/app_info.inc.php
+  echo '  $MAILCOW_UPDATEDAT='$(date +%s)';' >> data/web/inc/app_info.inc.php
+  echo '?>' >> data/web/inc/app_info.inc.php
+  echo -e "\e[33mCannot determine current git repository version...\e[0m"
+fi
+
 if [[ ${SKIP_START} == "y" ]]; then
-  echo -e "\e[33mNot starting mailcow, please run \"docker-compose up -d --remove-orphans\" to start mailcow.\e[0m"
+  echo -e "\e[33mNot starting mailcow, please run \"$COMPOSE_COMMAND up -d --remove-orphans\" to start mailcow.\e[0m"
 else
   echo -e "\e[32mStarting mailcow...\e[0m"
   sleep 2
-  docker-compose up -d --remove-orphans
+  $COMPOSE_COMMAND up -d --remove-orphans
 fi
 
 echo -e "\e[32mCollecting garbage...\e[0m"
 docker_garbage
 
-#echo "In case you encounter any problem, hard-reset to a state before updating mailcow:"
-#echo
-#git reflog --color=always | grep "Before update on "
-#echo
-#echo "Use \"git reset --hard hash-on-the-left\" and run docker-compose up -d afterwards."
+# Run post-update-hook
+if [ -f "${SCRIPT_DIR}/post_update_hook.sh" ]; then
+  bash "${SCRIPT_DIR}/post_update_hook.sh"
+fi
+
+# echo "In case you encounter any problem, hard-reset to a state before updating mailcow:"
+# echo
+# git reflog --color=always | grep "Before update on "
+# echo
+# echo "Use \"git reset --hard hash-on-the-left\" and run $COMPOSE_COMMAND up -d afterwards."

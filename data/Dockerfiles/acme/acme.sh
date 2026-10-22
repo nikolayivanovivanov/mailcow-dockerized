@@ -4,15 +4,26 @@ exec 5>&1
 
 # Do not attempt to write to slave
 if [[ ! -z ${REDIS_SLAVEOF_IP} ]]; then
-  export REDIS_CMDLINE="redis-cli -h ${REDIS_SLAVEOF_IP} -p ${REDIS_SLAVEOF_PORT}"
+  export REDIS_CMDLINE="redis-cli -h ${REDIS_SLAVEOF_IP} -p ${REDIS_SLAVEOF_PORT} -a ${REDISPASS} --no-auth-warning"
 else
-  export REDIS_CMDLINE="redis-cli -h redis -p 6379"
+  export REDIS_CMDLINE="redis-cli -h redis -p 6379 -a ${REDISPASS} --no-auth-warning"
 fi
 
 until [[ $(${REDIS_CMDLINE} PING) == "PONG" ]]; do
   echo "Waiting for Redis..."
   sleep 2
 done
+
+# Create DNS-01 configuration template if it doesn't exist
+if [[ ! -f /etc/acme/dns-01.conf ]]; then
+  mkdir -p /etc/acme
+  cat > /etc/acme/dns-01.conf <<'EOF'
+# Add here your DNS-01 challenge configuration
+# For more information, visit the acme.sh documentation:
+# https://github.com/acmesh-official/acme.sh/wiki/dnsapi
+EOF
+  echo "Created DNS-01 configuration template at /etc/acme/dns-01.conf"
+fi
 
 source /srv/functions.sh
 # Thanks to https://github.com/cvmiller -> https://github.com/cvmiller/expand6
@@ -33,9 +44,17 @@ if [[ "${ONLY_MAILCOW_HOSTNAME}" =~ ^([yY][eE][sS]|[yY])+$ ]]; then
   ONLY_MAILCOW_HOSTNAME=y
 fi
 
+if [[ "${AUTODISCOVER_SAN}" =~ ^([yY][eE][sS]|[yY])+$ ]]; then
+  AUTODISCOVER_SAN=y
+fi
+
 # Request individual certificate for every domain
 if [[ "${ENABLE_SSL_SNI}" =~ ^([yY][eE][sS]|[yY])+$ ]]; then
   ENABLE_SSL_SNI=y
+fi
+
+if [[ "${ACME_DNS_CHALLENGE}" =~ ^([yY][eE][sS]|[yY])+$ ]]; then
+  ACME_DNS_CHALLENGE=y
 fi
 
 if [[ "${SKIP_LETS_ENCRYPT}" =~ ^([yY][eE][sS]|[yY])+$ ]]; then
@@ -44,11 +63,23 @@ if [[ "${SKIP_LETS_ENCRYPT}" =~ ^([yY][eE][sS]|[yY])+$ ]]; then
   exec $(readlink -f "$0")
 fi
 
-log_f "Waiting for Docker API..." no_nl
+log_f "Waiting for Docker API..."
 until ping dockerapi -c1 > /dev/null; do
   sleep 1
 done
-log_f "OK" no_date
+log_f "Docker API OK"
+
+log_f "Waiting for Postfix..."
+until ping postfix -c1 > /dev/null; do
+  sleep 1
+done
+log_f "Postfix OK"
+
+log_f "Waiting for Dovecot..."
+until ping dovecot -c1 > /dev/null; do
+  sleep 1
+done
+log_f "Dovecot OK"
 
 ACME_BASE=/var/lib/acme
 SSL_EXAMPLE=/var/lib/ssl-example
@@ -60,7 +91,7 @@ mkdir -p ${ACME_BASE}/acme
 [[ -f ${ACME_BASE}/acme/private/account.key ]] && mv ${ACME_BASE}/acme/private/account.key ${ACME_BASE}/acme/account.pem
 if [[ -f ${ACME_BASE}/acme/key.pem && -f ${ACME_BASE}/acme/cert.pem ]]; then
   if verify_hash_match ${ACME_BASE}/acme/cert.pem ${ACME_BASE}/acme/key.pem; then
-    log_f "Migrating to SNI folder structure..." no_nl
+    log_f "Migrating to SNI folder structure..."
     CERT_DOMAIN=($(openssl x509 -noout -text -in ${ACME_BASE}/acme/cert.pem | grep "Subject:" | sed -e 's/\(Subject:\)\|\(CN = \)\|\(CN=\)//g' | sed -e 's/^[[:space:]]*//'))
     CERT_DOMAINS=(${CERT_DOMAIN} $(openssl x509 -noout -text -in ${ACME_BASE}/acme/cert.pem | grep "DNS:" | sed -e 's/\(DNS:\)\|,//g' | sed "s/${CERT_DOMAIN}//" | sed -e 's/^[[:space:]]*//'))
     mkdir -p ${ACME_BASE}/${CERT_DOMAIN}
@@ -100,31 +131,40 @@ fi
 
 chmod 600 ${ACME_BASE}/key.pem
 
-log_f "Waiting for database... " no_nl
-while ! mysqladmin status --socket=/var/run/mysqld/mysqld.sock -u${DBUSER} -p${DBPASS} --silent; do
+log_f "Waiting for database..."
+while ! /usr/bin/mariadb-admin status --ssl=false --socket=/var/run/mysqld/mysqld.sock -u${DBUSER} -p${DBPASS} --silent > /dev/null; do
   sleep 2
 done
-log_f "OK" no_date
+log_f "Database OK"
 
-log_f "Waiting for Nginx... " no_nl
-until $(curl --output /dev/null --silent --head --fail http://nginx:8081); do
+log_f "Waiting for Nginx..."
+until $(curl --output /dev/null --silent --head --fail http://nginx.${COMPOSE_PROJECT_NAME}_mailcow-network:8081); do
   sleep 2
 done
-log_f "OK" no_date
+log_f "Nginx OK"
+
+log_f "Waiting for resolver..."
+until dig letsencrypt.org +time=3 +tries=1 @unbound > /dev/null; do
+  sleep 2
+done
+log_f "Resolver OK"
 
 # Waiting for domain table
-log_f "Waiting for domain table... " no_nl
+log_f "Waiting for domain table..."
 while [[ -z ${DOMAIN_TABLE} ]]; do
-  curl --silent http://nginx/ >/dev/null 2>&1
-  DOMAIN_TABLE=$(mysql --socket=/var/run/mysqld/mysqld.sock -u ${DBUSER} -p${DBPASS} ${DBNAME} -e "SHOW TABLES LIKE 'domain'" -Bs)
+  curl --silent http://nginx.${COMPOSE_PROJECT_NAME}_mailcow-network/ >/dev/null 2>&1
+  DOMAIN_TABLE=$(mariadb --skip-ssl --socket=/var/run/mysqld/mysqld.sock -u ${DBUSER} -p${DBPASS} ${DBNAME} -e "SHOW TABLES LIKE 'domain'" -Bs)
   [[ -z ${DOMAIN_TABLE} ]] && sleep 10
 done
 log_f "OK" no_date
 
-log_f "Initializing, please wait... "
+log_f "Initializing, please wait..."
 
 while true; do
-
+  POSTFIX_CERT_SERIAL="$(echo | openssl s_client -connect postfix:25 -starttls smtp 2>/dev/null | openssl x509 -inform pem -noout -serial | cut -d "=" -f 2)"
+  DOVECOT_CERT_SERIAL="$(echo | openssl s_client -connect dovecot:143 -starttls imap 2>/dev/null | openssl x509 -inform pem -noout -serial | cut -d "=" -f 2)"
+  POSTFIX_CERT_SERIAL_NEW="$(echo | openssl s_client -connect postfix:25 -starttls smtp 2>/dev/null | openssl x509 -inform pem -noout -serial | cut -d "=" -f 2)"
+  DOVECOT_CERT_SERIAL_NEW="$(echo | openssl s_client -connect dovecot:143 -starttls imap 2>/dev/null | openssl x509 -inform pem -noout -serial | cut -d "=" -f 2)"
   # Re-using previous acme-mailcow account and domain keys
   if [[ ! -f ${ACME_BASE}/acme/key.pem ]]; then
     log_f "Generating missing domain private rsa key..."
@@ -178,30 +218,23 @@ while true; do
       ADDITIONAL_SAN_ARR+=($i)
     fi
   done
-  ADDITIONAL_WC_ARR+=('autodiscover' 'autoconfig')
 
+  if [[ ${AUTODISCOVER_SAN} == "y" ]]; then
+  # Fetch certs for autoconfig and autodiscover subdomains
+  ADDITIONAL_WC_ARR+=('autodiscover' 'autoconfig' 'mta-sts')
+  fi
+
+  if [[ ${SKIP_IP_CHECK} != "y" ]]; then
   # Start IP detection
-  log_f "Detecting IP addresses... " no_nl
+  log_f "Detecting IP addresses..."
   IPV4=$(get_ipv4)
   IPV6=$(get_ipv6)
-  log_f "OK" no_date
-
-  # Hard-fail on CAA errors for MAILCOW_HOSTNAME
-  MH_PARENT_DOMAIN=$(echo ${MAILCOW_HOSTNAME} | cut -d. -f2-)
-  MH_CAAS=( $(dig CAA ${MH_PARENT_DOMAIN} +short | sed -n 's/\d issue "\(.*\)"/\1/p') )
-  if [[ ! -z ${MH_CAAS} ]]; then
-    if [[ ${MH_CAAS[@]} =~ "letsencrypt.org" ]]; then
-      log_f "Validated CAA for parent domain ${MH_PARENT_DOMAIN}"
-    else
-      log_f "Skipping ACME validation: Lets Encrypt disallowed for ${MAILCOW_HOSTNAME} by CAA record, retrying in 1h..."
-      sleep 1h
-      exec $(readlink -f "$0")
-    fi
+  log_f "OK: ${IPV4}, ${IPV6:-"0000:0000:0000:0000:0000:0000:0000:0000"}"
   fi
 
   #########################################
   # IP and webroot challenge verification #
-  SQL_DOMAINS=$(mysql --socket=/var/run/mysqld/mysqld.sock -u ${DBUSER} -p${DBPASS} ${DBNAME} -e "SELECT domain FROM domain WHERE backupmx=0" -Bs)
+  SQL_DOMAINS=$(mariadb --skip-ssl --socket=/var/run/mysqld/mysqld.sock -u ${DBUSER} -p${DBPASS} ${DBNAME} -e "SELECT domain FROM domain WHERE backupmx=0 and active=1" -Bs)
   if [[ ! $? -eq 0 ]]; then
     log_f "Failed to read SQL domains, retrying in 1 minute..."
     sleep 1m
@@ -216,18 +249,71 @@ while true; do
   done <<< "${SQL_DOMAINS}"
 
   if [[ ${ONLY_MAILCOW_HOSTNAME} != "y" ]]; then
+  # Fetch all domains with an active MTA-STS policy once.
+  unset MTA_STS_ACTIVE_DOMAINS
+  declare -A MTA_STS_ACTIVE_DOMAINS
+  if [[ ${AUTODISCOVER_SAN} == "y" ]]; then
+    SQL_MTA_STS_DOMAINS=$(mariadb --skip-ssl --socket=/var/run/mysqld/mysqld.sock -u ${DBUSER} -p${DBPASS} ${DBNAME} -e "SELECT domain FROM mta_sts WHERE active = 1" -Bs)
+    if [[ $? -eq 0 ]]; then
+      while read mta_sts_domain; do
+        if [[ -z "${mta_sts_domain}" ]]; then
+          # ignore empty lines
+          continue
+        fi
+        MTA_STS_ACTIVE_DOMAINS["${mta_sts_domain}"]=1
+      done <<< "${SQL_MTA_STS_DOMAINS}"
+    fi
+  fi
   for SQL_DOMAIN in "${SQL_DOMAIN_ARR[@]}"; do
     unset VALIDATED_CONFIG_DOMAINS_SUBDOMAINS
     declare -a VALIDATED_CONFIG_DOMAINS_SUBDOMAINS
     for SUBDOMAIN in "${ADDITIONAL_WC_ARR[@]}"; do
-      if [[  "${SUBDOMAIN}.${SQL_DOMAIN}" != "${MAILCOW_HOSTNAME}" ]]; then
-        if check_domain "${SUBDOMAIN}.${SQL_DOMAIN}"; then
-          VALIDATED_CONFIG_DOMAINS_SUBDOMAINS+=("${SUBDOMAIN}.${SQL_DOMAIN}")
-        fi
+      FULL_SUBDOMAIN="${SUBDOMAIN}.${SQL_DOMAIN}"
+
+      # Skip mta-sts subdomain unless MTA-STS is enabled (active) for this domain
+      if [[ "${SUBDOMAIN}" == "mta-sts" && -z "${MTA_STS_ACTIVE_DOMAINS[${SQL_DOMAIN}]}" ]]; then
+        log_f "MTA-STS is not enabled for ${SQL_DOMAIN} - skipping mta-sts subdomain certificate"
+        continue
+      fi
+
+      # Skip if subdomain matches MAILCOW_HOSTNAME
+      if [[ "${FULL_SUBDOMAIN}" == "${MAILCOW_HOSTNAME}" ]]; then
+        continue
+      fi
+      # Skip if subdomain is covered by a wildcard in ADDITIONAL_SAN
+      if is_covered_by_wildcard "${FULL_SUBDOMAIN}"; then
+        log_f "Subdomain '${FULL_SUBDOMAIN}' is covered by wildcard - skipping explicit subdomain"
+        continue
+      fi
+      # Validate and add subdomain
+      if check_domain "${FULL_SUBDOMAIN}"; then
+        VALIDATED_CONFIG_DOMAINS_SUBDOMAINS+=("${FULL_SUBDOMAIN}")
       fi
     done
     VALIDATED_CONFIG_DOMAINS+=("${VALIDATED_CONFIG_DOMAINS_SUBDOMAINS[*]}")
   done
+
+  # Fetch alias domains where target domain has MTA-STS enabled
+  if [[ ${AUTODISCOVER_SAN} == "y" ]]; then
+    SQL_ALIAS_DOMAINS=$(mariadb --skip-ssl --socket=/var/run/mysqld/mysqld.sock -u ${DBUSER} -p${DBPASS} ${DBNAME} -e "SELECT ad.alias_domain FROM alias_domain ad INNER JOIN mta_sts m ON ad.target_domain = m.domain WHERE ad.active = 1 AND m.active = 1" -Bs)
+    if [[ $? -eq 0 ]]; then
+      while read alias_domain; do
+        if [[ -z "${alias_domain}" ]]; then
+          # ignore empty lines
+          continue
+        fi
+        # Only add mta-sts subdomain for alias domains
+        if [[ "mta-sts.${alias_domain}" != "${MAILCOW_HOSTNAME}" ]]; then
+          # Skip if mta-sts subdomain is covered by a wildcard
+          if is_covered_by_wildcard "mta-sts.${alias_domain}"; then
+            log_f "Alias domain mta-sts subdomain 'mta-sts.${alias_domain}' is covered by wildcard - skipping"
+          elif check_domain "mta-sts.${alias_domain}"; then
+            VALIDATED_CONFIG_DOMAINS+=("mta-sts.${alias_domain}")
+          fi
+        fi
+      done <<< "${SQL_ALIAS_DOMAINS}"
+    fi
+  fi
   fi
 
   if check_domain ${MAILCOW_HOSTNAME}; then
@@ -256,13 +342,31 @@ while true; do
   done
   fi
 
+  # Check if MAILCOW_HOSTNAME is covered by a wildcard in ADDITIONAL_SAN
+  MAILCOW_HOSTNAME_COVERED=0
+  if [[ ! -z ${VALIDATED_MAILCOW_HOSTNAME} ]]; then
+    if is_covered_by_wildcard "${VALIDATED_MAILCOW_HOSTNAME}"; then
+      MAILCOW_PARENT_DOMAIN=$(echo ${VALIDATED_MAILCOW_HOSTNAME} | cut -d. -f2-)
+      log_f "MAILCOW_HOSTNAME '${VALIDATED_MAILCOW_HOSTNAME}' is covered by wildcard '*.${MAILCOW_PARENT_DOMAIN}' - skipping explicit hostname"
+      MAILCOW_HOSTNAME_COVERED=1
+    fi
+  fi
+
   # Unique domains for server certificate
   if [[ ${ENABLE_SSL_SNI} == "y" ]]; then
     # create certificate for server name and fqdn SANs only
-    SERVER_SAN_VALIDATED=(${VALIDATED_MAILCOW_HOSTNAME} $(echo ${ADDITIONAL_VALIDATED_SAN[*]} | xargs -n1 | sort -u | xargs))
+    if [[ ${MAILCOW_HOSTNAME_COVERED} == "1" ]]; then
+      SERVER_SAN_VALIDATED=($(echo ${ADDITIONAL_VALIDATED_SAN[*]} | xargs -n1 | sort -u | xargs))
+    else
+      SERVER_SAN_VALIDATED=(${VALIDATED_MAILCOW_HOSTNAME} $(echo ${ADDITIONAL_VALIDATED_SAN[*]} | xargs -n1 | sort -u | xargs))
+    fi
   else
     # create certificate for all domains, including all subdomains from other domains [*]
-    SERVER_SAN_VALIDATED=(${VALIDATED_MAILCOW_HOSTNAME} $(echo ${VALIDATED_CONFIG_DOMAINS[*]} ${ADDITIONAL_VALIDATED_SAN[*]} | xargs -n1 | sort -u | xargs))
+    if [[ ${MAILCOW_HOSTNAME_COVERED} == "1" ]]; then
+      SERVER_SAN_VALIDATED=($(echo ${VALIDATED_CONFIG_DOMAINS[*]} ${ADDITIONAL_VALIDATED_SAN[*]} | xargs -n1 | sort -u | xargs))
+    else
+      SERVER_SAN_VALIDATED=(${VALIDATED_MAILCOW_HOSTNAME} $(echo ${VALIDATED_CONFIG_DOMAINS[*]} ${ADDITIONAL_VALIDATED_SAN[*]} | xargs -n1 | sort -u | xargs))
+    fi
   fi
   if [[ ! -z ${SERVER_SAN_VALIDATED[*]} ]]; then
     CERT_NAME=${SERVER_SAN_VALIDATED[0]}
@@ -282,8 +386,11 @@ while true; do
       CERT_ERRORS=1
     fi
     # copy hostname certificate to default/server certificate
-    cp ${ACME_BASE}/${CERT_NAME}/cert.pem ${ACME_BASE}/cert.pem
-    cp ${ACME_BASE}/${CERT_NAME}/key.pem ${ACME_BASE}/key.pem
+    # do not a key when cert is missing, this can lead to a mismatch of cert/key
+    if [[ -f ${ACME_BASE}/${CERT_NAME}/cert.pem ]]; then
+      cp ${ACME_BASE}/${CERT_NAME}/cert.pem ${ACME_BASE}/cert.pem
+      cp ${ACME_BASE}/${CERT_NAME}/key.pem ${ACME_BASE}/key.pem
+    fi
   fi
 
   # individual certificates for SNI [@]
@@ -351,7 +458,27 @@ while true; do
   # reload on new or changed certificates
   if [[ "${CERT_CHANGED}" == "1" ]]; then
     rm -f "${ACME_BASE}/force_renew" 2> /dev/null
-    CERT_AMOUNT_CHANGED=${CERT_AMOUNT_CHANGED} /srv/reload-configurations.sh
+    RELOAD_LOOP_C=1
+    while [[ "${POSTFIX_CERT_SERIAL}" == "${POSTFIX_CERT_SERIAL_NEW}" ]] || [[ "${DOVECOT_CERT_SERIAL}" == "${DOVECOT_CERT_SERIAL_NEW}" ]] || [[ ${#POSTFIX_CERT_SERIAL_NEW} -ne 36 ]] || [[ ${#DOVECOT_CERT_SERIAL_NEW} -ne 36 ]]; do
+      log_f "Reloading or restarting services... (${RELOAD_LOOP_C})"
+      RELOAD_LOOP_C=$((RELOAD_LOOP_C + 1))
+      CERT_AMOUNT_CHANGED=${CERT_AMOUNT_CHANGED} /srv/reload-configurations.sh
+      log_f "Waiting for containers to settle..."
+      sleep 10
+      until nc -z dovecot 143; do
+        sleep 1
+      done
+      until nc -z postfix 25; do
+        sleep 1
+      done
+      POSTFIX_CERT_SERIAL_NEW="$(echo | openssl s_client -connect postfix:25 -starttls smtp 2>/dev/null | openssl x509 -inform pem -noout -serial | cut -d "=" -f 2)"
+      DOVECOT_CERT_SERIAL_NEW="$(echo | openssl s_client -connect dovecot:143 -starttls imap 2>/dev/null | openssl x509 -inform pem -noout -serial | cut -d "=" -f 2)"
+      if [[ ${RELOAD_LOOP_C} -gt 3 ]]; then
+        log_f "Some services do return old end dates, something went wrong!"
+        ${REDIS_CMDLINE} SET ACME_FAIL_TIME "$(date +%s)"
+        break;
+      fi
+    done
   fi
 
   case "$CERT_ERRORS" in

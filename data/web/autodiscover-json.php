@@ -8,7 +8,7 @@ if(file_exists('inc/vars.local.inc.php')) {
 $autodiscover_config = array_merge($default_autodiscover_config, $autodiscover_config);
 
 header('Content-type: application/json');
-if (strtolower($_GET['Protocol']) == 'activesync') {
+if (strtolower($_GET['Protocol']) == 'activesync' && getenv('SKIP_SOGO') != "y") {
   echo '{"Protocol":"ActiveSync","Url":"' . $autodiscover_config['activesync']['url'] . '"}';
 }
 elseif (strtolower($_GET['Protocol']) == 'autodiscoverv1') {
@@ -16,6 +16,6 @@ elseif (strtolower($_GET['Protocol']) == 'autodiscoverv1') {
 }
 else {
   http_response_code(400);
-  echo '{"ErrorCode":"InvalidProtocol","ErrorMessage":"The given protocol value \u0027' . $_GET['Protocol'] . '\u0027 is invalid. Supported values are \u0027ActiveSync,AutodiscoverV1\u0027"}';
+  echo '{"ErrorCode":"InvalidProtocol","ErrorMessage":"The given protocol value \u0027' . preg_replace("/[^\da-z]/i", '', $_GET['Protocol']) . '\u0027 is invalid. Supported values are \u0027ActiveSync,AutodiscoverV1\u0027"}';
 }
 ?>

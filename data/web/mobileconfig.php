@@ -8,6 +8,7 @@ if (!isset($_SESSION['mailcow_cc_role']) || $_SESSION['mailcow_cc_role'] != 'use
   session_destroy();
   // probably better than appending the whole current http query string
   $append_get = (isset($_GET['only_email'])) ? '&only_email' : '';
+  $append_get .= (isset($_GET['app_password'])) ? '&app_password' : '';
   header('Location: index.php?mobileconfig' . $append_get);
   die();
 }
@@ -33,10 +34,40 @@ catch(PDOException $e) {
 
 if (isset($_GET['only_email'])) {
   $onlyEmailAccount = true;
-  $description = 'IMAP';  
+  $description = 'IMAP';
 } else {
   $onlyEmailAccount = false;
-  $description = 'IMAP, CalDAV, CardDAV'; 
+  $description = 'IMAP, CalDAV, CardDAV';
+}
+if (isset($_GET['app_password'])) {
+  $app_password = true;
+  $description .= ' with application password';
+
+  if (strpos($_SERVER['HTTP_USER_AGENT'], 'iPad') !== FALSE)
+      $platform = 'iPad';
+  elseif (strpos($_SERVER['HTTP_USER_AGENT'], 'iPhone') !== FALSE)
+      $platform = 'iPhone';
+  elseif (strpos($_SERVER['HTTP_USER_AGENT'], 'Macintosh') !== FALSE)
+      $platform = 'Mac';
+  else
+      $platform = $_SERVER['HTTP_USER_AGENT'];
+
+  $password = password_generate();
+
+  $attr = array(
+      'app_name' => $platform,
+      'app_passwd' => $password,
+      'app_passwd2' => $password,
+      'active' => 1,
+      'protocols' => array('imap_access', 'smtp_access'),
+  );
+  if (!$onlyEmailAccount) {
+      $attr['protocols'][] = 'dav_access';
+  }
+  app_passwd("add", $attr);
+  $password = htmlspecialchars($password, ENT_NOQUOTES);
+} else {
+  $app_password = false;
 }
 
 echo '<?xml version="1.0" encoding="UTF-8"?>' . "\n";
@@ -65,6 +96,10 @@ echo '<?xml version="1.0" encoding="UTF-8"?>' . "\n";
         <true/>
         <key>IncomingMailServerUsername</key>
         <string><?=$email?></string>
+        <?php if($app_password === true): ?>
+        <key>IncomingPassword</key>
+        <string><?=$password?></string>
+        <?php endif; ?>
         <key>OutgoingMailServerAuthentication</key>
         <string>EmailAuthPassword</string>
         <key>OutgoingMailServerHostName</key>
@@ -95,8 +130,16 @@ echo '<?xml version="1.0" encoding="UTF-8"?>' . "\n";
         <false/>
         <key>PreventMove</key>
         <false/>
-        <key>SMIMEEnabled</key>
-        <false/>
+        <key>SMIMESigningUserOverrideable</key>
+        <true/>
+        <key>SMIMESigningCertificateUUIDUserOverrideable</key>
+        <true/>
+        <key>SMIMEEncryptByDefaultUserOverrideable</key>
+        <true/>
+        <key>SMIMEEncryptionCertificateUUIDUserOverrideable</key>
+        <true/>
+        <key>SMIMEEnableEncryptionPerMessageSwitch</key>
+        <true/>
       </dict>
       <?php if($onlyEmailAccount === false): ?>
       <dict>
@@ -112,6 +155,10 @@ echo '<?xml version="1.0" encoding="UTF-8"?>' . "\n";
         <true/>
         <key>CalDAVUsername</key>
         <string><?=$email?></string>
+        <?php if($app_password === true): ?>
+        <key>CalDAVPassword</key>
+        <string><?=$password?></string>
+        <?php endif; ?>
         <key>PayloadDescription</key>
         <string>Configures CalDAV account.</string>
         <key>PayloadDisplayName</key>
@@ -140,6 +187,10 @@ echo '<?xml version="1.0" encoding="UTF-8"?>' . "\n";
         <true/>
         <key>CardDAVUsername</key>
         <string><?=$email?></string>
+        <?php if($app_password === true): ?>
+        <key>CardDAVPassword</key>
+        <string><?=$password?></string>
+        <?php endif; ?>
         <key>PayloadDescription</key>
         <string>Configures CardDAV accounts</string>
         <key>PayloadDisplayName</key>
