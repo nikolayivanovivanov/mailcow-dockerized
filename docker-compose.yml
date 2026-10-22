@@ -676,7 +676,7 @@ networks:
     driver: bridge
     driver_opts:
       com.docker.network.bridge.name: br-mailcow
-    enable_ipv6: ${ENABLE_IPV6:-fslse}
+    enable_ipv6: ${ENABLE_IPV6:-false}
     ipam:
       driver: default
       config:
