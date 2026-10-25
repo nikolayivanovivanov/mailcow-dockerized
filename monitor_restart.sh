@@ -17,7 +17,7 @@ if [ $rspam_dload -gt 90 ]; then
   rspam_dload=${rspam_dload%.*}
   if [ $rspam_dload -gt 90 ]; then
     cd /opt/mailcow-dockerized
-    /usr/local/bin/docker-compose -f /opt/mailcow-dockerized/docker-compose.yml restart
+    /usr/local/bin/docker compose -f /opt/mailcow-dockerized/docker-compose.yml restart
     # sleep 60
     # docker-compose up -d
     sleep 60
